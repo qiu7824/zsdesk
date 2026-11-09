@@ -318,6 +318,13 @@ impl WindowState {
         else { self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|t|t.current().address()).unwrap_or_default() }
     }
 
+    /// Recreates the inactive pane's Shell view at its current folder.
+    pub(super) fn rebuild_other_pane(&mut self) {
+        if self.other_pane.browser.is_none() { return; }
+        self.destroy_other_pane();
+        self.ensure_dual_pane();
+    }
+
     pub(super) fn destroy_other_pane(&mut self) {
         if let Some(browser)=&self.other_pane.browser {
             if self.other_pane.pending.is_none() {

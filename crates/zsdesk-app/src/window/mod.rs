@@ -645,7 +645,10 @@ impl WindowState {
     fn refresh_system_theme(&mut self){
         // A changed caption/frame mode invalidates an in-progress press.
         unsafe{SendMessageW(self.hwnd,WM_CANCELMODE,None,None);}
+        let was_dark=self.dark;
         self.apply_theme();self.theme_children();
+        // Following a system switch between light and dark.
+        if was_dark!=self.dark { self.rebuild_views_for_theme(); }
         self.relayout();self.position_children();self.invalidate();
     }
 

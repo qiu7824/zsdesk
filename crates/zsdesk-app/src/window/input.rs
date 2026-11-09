@@ -397,6 +397,11 @@ impl WindowState {
         if !details_changed {unsafe{self.resize();}return;}
         // IExplorerBrowser reads pane visibility only while initializing, so the
         // view is recreated and returns to the same folder, selection and layout.
+        self.recreate_browser("无法切换窗格");
+    }
+
+    /// Rebuilds the active Shell view in place: same folder, selection and layout.
+    fn recreate_browser(&mut self, failure: &str) {
         unsafe { self.capture_active(); }
         self.folder_sizes.cancel();self.cancel_fast_search();self.browser = None;self.browser_role=BrowserRole::Fresh;
         self.pending = None;
@@ -405,13 +410,21 @@ impl WindowState {
         let created=self.create_browser();
         match created {
             Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);},
-            Err(error) => self.show_message(format!("无法切换窗格：{error}")),
+            Err(error) => self.show_message(format!("{failure}：{error}")),
         }
         self.icons.clear();
         unsafe { self.resize(); }
         self.theme_children();
         unsafe { self.navigate_current(); }
         self.invalidate_rect(self.layout.command_row);
+    }
+
+    /// On Windows 10 a Shell view keeps the dark/light mode it was created
+    /// with, so both panes are rebuilt when the effective theme flips.
+    pub(super) fn rebuild_views_for_theme(&mut self) {
+        if !zsdesk_windows::theme::views_need_forced_mode() { return; }
+        self.recreate_browser("无法更新文件视图配色");
+        self.rebuild_other_pane();
     }
 
     fn set_view(&mut self, choice: Option<menus::ViewChoice>) {
@@ -608,10 +621,9 @@ impl WindowState {
         if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
         let old=self.session.ui.appearance.clone();
         if !menus::apply_appearance(&mut self.session.ui.appearance,id) || self.session.ui.appearance==old { return; }
+        let was_dark=self.dark;
         self.apply_theme();self.theme_children();
-        if old.color_scheme!=self.session.ui.appearance.color_scheme {
-            self.set_panes(self.session.ui.show_preview,self.session.ui.show_details);
-        }
+        if was_dark!=self.dark { self.rebuild_views_for_theme(); }
         self.save();self.relayout();self.position_children();self.invalidate();
         let _=crate::quick_search::control::signal(&self.config_path,"reload");
     }
