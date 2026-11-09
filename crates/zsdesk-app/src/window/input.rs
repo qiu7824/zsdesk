@@ -1,5 +1,5 @@
 use super::*;
-use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey, UiCommand}};
+use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey}};
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 impl WindowState {
@@ -500,7 +500,7 @@ impl WindowState {
                 let r = self.browser.as_ref().map(|b| if self.view_status.selected > 0 { b.invoke_selection(hwnd, "properties", false) } else { b.invoke_background(hwnd, "properties") });
                 self.shell_result(r);
             }
-            Some("folder-options") => open_folder_options(),
+            Some("options") => open_folder_options(),
             Some("map-drive") if crate::edition::NETWORK => {
                 use windows::Win32::NetworkManagement::WNet::{WNetConnectionDialog, RESOURCETYPE_DISK};
                 let _ = unsafe { WNetConnectionDialog(hwnd, RESOURCETYPE_DISK.0) };
@@ -771,51 +771,17 @@ pub(super) fn set_clipboard_text(owner: HWND, text: &str) {
     }
 }
 
-/// Shows a ZSUI menu spec as a native popup. `anchor` (client rect) places it below a button.
+/// Shows a ZSUI menu spec as a Windows 11 style flyout. `anchor` (client
+/// rect) places it below a button; otherwise it opens at the cursor.
 pub(super) fn popup(owner: HWND, spec: &MenuSpec, anchor: Option<LayoutRect>) -> Option<String> {
-    let mut ids: Vec<String> = Vec::new();
-    // Declared before the menu so its bitmaps outlive DestroyMenu.
-    let mut icons = zsdesk_windows::menu_icons::MenuIcons::new(owner);
-    let menu = build_menu(spec, &mut ids, &mut icons)?;
-    let mut pt = POINT::default();
-    let mut flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
-    if let Some(r) = anchor {
-        pt = POINT { x: r.x, y: r.bottom() };
-        let _ = unsafe { ClientToScreen(owner, &mut pt) };
-        flags |= TPM_LEFTALIGN | TPM_TOPALIGN;
-    } else {
-        let _ = unsafe { GetCursorPos(&mut pt) };
-    }
-    let selected = unsafe { TrackPopupMenu(menu, flags, pt.x, pt.y, None, owner, None) }.0;
-    let _ = unsafe { DestroyMenu(menu) };
-    selected.checked_sub(1).and_then(|i| ids.get(i as usize)).cloned()
-}
-
-fn build_menu(spec: &MenuSpec, ids: &mut Vec<String>, icons: &mut zsdesk_windows::menu_icons::MenuIcons) -> Option<HMENU> {
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    for item in &spec.items {
-        match item {
-            MenuItemSpec::Command { label, command: UiCommand::Custom { id, .. }, checked, enabled, .. } => {
-                ids.push(id.clone());
-                let flags = MF_STRING | if *checked { MF_CHECKED } else { MF_UNCHECKED } | if *enabled { MF_ENABLED } else { MF_GRAYED };
-                let added = unsafe { AppendMenuW(menu, flags, ids.len(), PCWSTR(wide(label).as_ptr())) }.is_ok();
-                if let Some(glyph) = menus::command_glyph(id).filter(|_| added && !*checked) {
-                    icons.attach(menu, ids.len() as u32, false, glyph, *enabled);
-                }
-            }
-            MenuItemSpec::Submenu { id, label, menu: inner, enabled } => {
-                if let Some(sub) = build_menu(inner, ids, icons) {
-                    let flags = MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-                    let added = unsafe { AppendMenuW(menu, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) }.is_ok();
-                    if let Some(glyph) = id.as_deref().and_then(menus::command_glyph).filter(|_| added) {
-                        let position = unsafe { GetMenuItemCount(Some(menu)) }.max(1) as u32 - 1;
-                        icons.attach(menu, position, true, glyph, *enabled);
-                    }
-                }
-            }
-            MenuItemSpec::Separator => { let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, None) }; }
-            _ => {}
+    use crate::flyout_menu::{MenuAnchor, MenuBounds};
+    let anchor = match anchor {
+        Some(r) => {
+            let mut corners = [POINT { x: r.x, y: r.y }, POINT { x: r.right(), y: r.bottom() }];
+            for corner in &mut corners { let _ = unsafe { ClientToScreen(owner, corner) }; }
+            MenuAnchor::Below(MenuBounds::new(corners[0].x, corners[0].y, corners[1].x, corners[1].y))
         }
-    }
-    Some(menu)
+        None => { let mut point = POINT::default(); let _ = unsafe { GetCursorPos(&mut point) }; MenuAnchor::Point { x: point.x, y: point.y } }
+    };
+    crate::flyout_menu::show(owner, spec, anchor, zsdesk_windows::theme::menus_dark())
 }

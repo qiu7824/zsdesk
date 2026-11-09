@@ -3,6 +3,7 @@
 //! 业务 crate 禁止 `unsafe`，这里不设限制，但所有接口必须收敛为安全 API。
 
 pub mod enumerate;
+pub mod flyout_layout;
 
 #[cfg(windows)]
 pub mod desktop;
@@ -11,7 +12,7 @@ pub mod gfx;
 #[cfg(windows)]
 pub mod integration;
 #[cfg(windows)]
-pub mod menu_icons;
+pub mod flyout;
 #[cfg(windows)]
 pub mod ole;
 #[cfg(windows)]

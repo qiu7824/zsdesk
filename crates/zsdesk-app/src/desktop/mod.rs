@@ -228,6 +228,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context("Direct2D 初始化失败")?;
+    zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
     let hook = config.settings.double_click_toggle;
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
@@ -898,33 +899,26 @@ fn run_verb(fence: u64, verb: &'static str, background: bool) {
 fn insert_top(hmenu: HMENU, items: &[MenuItemSpec]) -> Vec<String> {
     let mut ids = Vec::new();
     let mut position = 0u32;
-    for item in items { insert_item_with_icons(hmenu, &mut position, item, &mut ids, None); }
+    for item in items { insert_item(hmenu, &mut position, item, &mut ids); }
     if !items.is_empty() { unsafe { let _ = InsertMenuW(hmenu, position, MF_BYPOSITION | MF_SEPARATOR, 0, None); } }
     ids
 }
 
-fn insert_item_with_icons(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut Vec<String>,
-    mut icons: Option<&mut zsdesk_windows::menu_icons::MenuIcons>) {
+fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut Vec<String>) {
     match item {
         MenuItemSpec::Command { label, command: UiCommand::Custom { id, .. }, checked, enabled, .. } => {
             let command = APP_FIRST as usize + ids.len();
             ids.push(id.clone());
             let flags = MF_BYPOSITION | MF_STRING | if *checked { MF_CHECKED } else { MF_UNCHECKED } | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            let added = unsafe { InsertMenuW(hmenu, *position, flags, command, PCWSTR(wide(label).as_ptr())) }.is_ok();
-            if let (Some(icons), Some(glyph)) = (icons, zsdesk_ui::menus::command_glyph(id).filter(|_| added && !*checked)) {
-                icons.attach(hmenu, *position, true, glyph, *enabled);
-            }
+            unsafe { let _ = InsertMenuW(hmenu, *position, flags, command, PCWSTR(wide(label).as_ptr())); }
             *position += 1;
         }
-        MenuItemSpec::Submenu { id, label, menu, enabled } => {
+        MenuItemSpec::Submenu { label, menu, enabled, .. } => {
             let Ok(sub) = (unsafe { CreatePopupMenu() }) else { return };
             let mut inner = 0u32;
-            for child in &menu.items { insert_item_with_icons(sub, &mut inner, child, ids, icons.as_deref_mut()); }
+            for child in &menu.items { insert_item(sub, &mut inner, child, ids); }
             let flags = MF_BYPOSITION | MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            let added = unsafe { InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) }.is_ok();
-            if let (Some(icons), Some(glyph)) = (icons, id.as_deref().and_then(zsdesk_ui::menus::command_glyph).filter(|_| added)) {
-                icons.attach(hmenu, *position, true, glyph, *enabled);
-            }
+            unsafe { let _ = InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())); }
             *position += 1;
         }
         MenuItemSpec::Separator => {
@@ -935,15 +929,10 @@ fn insert_item_with_icons(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec,
     }
 }
 
-/// Plain popup for a ZSUI menu spec.
+/// Fence, tab and tray menus as Windows 11 style flyouts at `point`.
 fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
-    // Declared before the menu so its bitmaps outlive DestroyMenu.
-    let mut icons = zsdesk_windows::menu_icons::MenuIcons::new(owner);
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item_with_icons(menu, &mut p, item, &mut ids, Some(&mut icons)); } ids };
-    let chosen = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, None, owner, None) }.0 as u32;
-    let _ = unsafe { DestroyMenu(menu) };
-    chosen.checked_sub(APP_FIRST).and_then(|i| ids.get(i as usize)).cloned()
+    let dark = with_host(|host| host.menu_dark()).unwrap_or_else(zsdesk_windows::theme::system_dark_mode);
+    crate::flyout_menu::show(owner, spec, crate::flyout_menu::MenuAnchor::Point { x: point.x, y: point.y }, dark)
 }
 
 // ---- drag and drop target ---------------------------------------------------------

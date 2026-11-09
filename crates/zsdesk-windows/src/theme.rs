@@ -56,8 +56,9 @@ fn uxtheme_ordinal(ordinal: usize) -> Option<unsafe extern "system" fn() -> isiz
 
 static MENUS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether popup menus of this process currently draw dark (glyph color).
-pub fn menus_dark() -> bool { MENUS_DARK.load(std::sync::atomic::Ordering::Relaxed) && uxtheme_ordinal(135).is_some() && !high_contrast() }
+/// Whether this process's application menus use the dark theme (the file
+/// window's color scheme, as last applied).
+pub fn menus_dark() -> bool { MENUS_DARK.load(std::sync::atomic::Ordering::Relaxed) && !high_contrast() }
 
 /// Lets Shell views, trees and menus in this process use dark visuals.
 pub fn allow_dark_mode(dark: bool) {

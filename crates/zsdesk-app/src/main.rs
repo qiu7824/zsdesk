@@ -13,6 +13,7 @@ mod window;
 mod instance;
 mod reveal;
 mod context_preferences;
+mod flyout_menu;
 mod routing_control;
 mod fast_search;
 mod quick_search;

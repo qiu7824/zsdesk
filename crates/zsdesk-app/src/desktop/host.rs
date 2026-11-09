@@ -272,10 +272,16 @@ impl DesktopHost {
         !self.shutting_down && self.loader.accepts_notification(token)
     }
 
-    pub fn update_palette(&mut self) {
-        let dark = match self.config.settings.theme {
+    /// Fence, tab and tray menus follow the fence theme.
+    pub fn menu_dark(&self) -> bool {
+        match self.config.settings.theme {
             FenceTheme::Dark => true, FenceTheme::Light => false, FenceTheme::System => zsdesk_windows::theme::system_dark_mode(),
-        };
+        }
+    }
+
+    pub fn update_palette(&mut self) {
+        let dark = self.menu_dark();
+        zsdesk_windows::flyout::refresh_system();
         self.palette = FencePalette::new(if dark { Mode::Dark } else { Mode::Light }, self.config.settings.opacity);
         if let Some(accent) = zsdesk_windows::theme::system_accent(dark) { self.palette = self.palette.with_accent(accent); }
     }
@@ -1436,7 +1442,8 @@ impl DesktopHost {
         // Keep it open while one of its menus is showing.
         let mut gui = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
         let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
-        let menu_open = unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok() && (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
+        let menu_open = zsdesk_windows::flyout::is_open()
+            || unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok() && (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
         if !inside && !menu_open { self.peek(id, false); }
     }
 

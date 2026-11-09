@@ -446,6 +446,8 @@ impl WindowState {
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
         self.gfx = Some(Gfx::new(&family).context("Direct2D 初始化失败")?);
+        // Menus are drawn, not created by Win32: prepare them before first use.
+        zsdesk_windows::flyout::prepare();
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
         self.search_edit = unsafe { child(hwnd, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true)? };
         for (edit, id) in [(self.address_edit, ID_ADDRESS), (self.search_edit, ID_SEARCH)] {
@@ -622,6 +624,7 @@ impl WindowState {
         let prefs=if crate::edition::THEMED {self.session.ui.appearance.clone()}
             else {zsdesk_core::model::explorer::AppearancePreferences::default()};
         self.dark = theme::configure_color_scheme(prefs.color_scheme);
+        zsdesk_windows::flyout::refresh_system();
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
         if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
         theme::set_dark_frame(self.hwnd, self.dark);

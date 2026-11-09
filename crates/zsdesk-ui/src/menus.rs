@@ -125,42 +125,27 @@ pub fn more_menu(has_selection: bool, network: bool) -> MenuSpec {
             MenuItemSpec::Separator,
         ]);
     }
-    items.push(item("选项", "folder-options"));
+    items.push(item("选项", "options"));
     menu(items)
 }
 
-/// Segoe Fluent Icons / MDL2 glyph shown beside a menu command, keyed by the
-/// command id. Only ids with one meaning in every ZSDesk menu are listed.
-pub fn command_glyph(id: &str) -> Option<&'static str> {
+/// Fluent glyph (and whether it uses the accent color) for the few commands
+/// that carry one in Windows 11 Explorer's "See more" menu: undo, the
+/// selection commands, properties and options. Other menus stay text-only,
+/// like their Windows 11 counterparts.
+pub fn command_glyph(id: &str) -> Option<(&'static str, bool)> {
     Some(match id {
-        "undo" | "history-undo" => "\u{E7A7}",
-        "history-redo" => "\u{E7A6}",
-        "refresh" => "\u{E72C}",
-        "new-fence" => "\u{E710}",
-        "select-all" => "\u{E8B3}",
-        "select-none" => "\u{E8E6}",
-        "select-invert" => "\u{E762}",
-        "copy-path" => "\u{E8C8}",
-        "terminal" => "\u{E756}",
-        "properties" => "\u{E90F}",
-        "folder-options" => "\u{E713}",
-        "settings-layout" => "\u{E8A9}",
-        "settings-tabs" => "\u{E737}",
-        "settings-preview" => "\u{E8FF}",
-        "settings-search" => "\u{E721}",
-        "settings-context-menu" => "\u{E8FD}",
-        "settings-appearance" => "\u{E790}",
-        "settings-desktop" => "\u{ECA5}",
-        "settings-integration" => "\u{E7AC}",
-        "map-drive" => "\u{E8CE}",
-        "disconnect-drive" => "\u{E8CD}",
-        "add-netplace" => "\u{E968}",
-        "new-tab" => "\u{E710}",
-        "new-window" => "\u{E78B}",
-        "shortcuts" => "\u{E765}",
-        "bookmark" => "\u{E734}",
-        "diagnostics" => "\u{E9D9}",
-        "about" => "\u{E946}",
+        "undo" => ("\u{E7A7}", true),
+        "select-all" => ("\u{E8B3}", true),
+        "select-none" => ("\u{E8E6}", true),
+        "select-invert" => ("\u{E762}", true),
+        "copy-path" => ("\u{E8C8}", false),
+        "terminal" => ("\u{E756}", false),
+        "properties" => ("\u{E90F}", false),
+        "options" => ("\u{E713}", false),
+        "map-drive" => ("\u{E8CE}", false),
+        "disconnect-drive" => ("\u{E8CD}", false),
+        "add-netplace" => ("\u{E968}", false),
         _ => return None,
     })
 }
@@ -475,11 +460,12 @@ mod tests {
         let spec = more_menu(false, false);
         let order = ids(&spec);
         assert_eq!(&order[..4], ["undo", "select-all", "select-none", "select-invert"]);
-        assert_eq!(order.last().map(String::as_str), Some("folder-options"));
+        assert_eq!(order.last().map(String::as_str), Some("options"));
         for id in &order {
-            let glyph = command_glyph(id).unwrap_or_else(|| panic!("{id} has no glyph"));
+            let (glyph, _) = command_glyph(id).unwrap_or_else(|| panic!("{id} has no glyph"));
             assert!(glyph.chars().all(|c| (0xE700..=0xE9FF).contains(&(c as u32))), "{id} must exist in Segoe MDL2 Assets");
         }
+        assert!(command_glyph("new-tab").is_none() && command_glyph("folder-options").is_none(), "the ≡ menu stays text-only");
         assert!(spec.items.iter().any(|item| matches!(item, MenuItemSpec::Command { label, enabled: false, .. } if label == "全部取消")));
     }
     #[test]
@@ -545,7 +531,6 @@ mod tests {
             MenuItemSpec::Submenu { id: Some(id), .. } => Some(id.as_str()), _ => None }).collect();
         assert_eq!(groups, ["settings-layout", "settings-tabs", "settings-preview", "settings-search", "settings-context-menu",
             "settings-appearance", "settings-desktop", "settings-integration"]);
-        assert!(groups.iter().all(|id| command_glyph(id).is_some()));
         assert!(spec.items.len() <= 20, "the top level stays short");
     }
 
