@@ -205,8 +205,7 @@ const PRESENTER_SERVER_KEY: &str = "CLSID\\{86CA1AA0-34AA-4E8B-A509-50C905BAE2A2
 /// presentation directly in that case. `None` (registration unreadable) keeps
 /// the native verification as the authority.
 pub fn modern_presenter_supported() -> Option<bool> {
-    static SUPPORTED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
+    *PRESENTER_SUPPORT.get_or_init(|| {
         if !cfg!(all(target_arch = "x86_64", target_env = "msvc")) { return Some(false); }
         let build = crate::theme::os_build();
         if build != 0 && build < 22000 { return Some(false); }
@@ -214,6 +213,19 @@ pub fn modern_presenter_supported() -> Option<bool> {
         let digest = file_sha256(&path)?;
         Some(digest.eq_ignore_ascii_case(SUPPORTED_PRESENTER_SHA256))
     })
+}
+
+static PRESENTER_SUPPORT: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+
+/// Starts [`modern_presenter_supported`] on a background thread so the first
+/// window and the first menu find the answer ready instead of reading and
+/// hashing the system module themselves.
+pub fn prefetch_modern_presenter_support() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("zsdesk-menu-detection".into())
+            .spawn(|| { let _ = modern_presenter_supported(); });
+    });
 }
 
 fn presenter_server_path() -> Option<std::path::PathBuf> {
@@ -246,8 +258,10 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
 
 pub fn set_context_menu_options(mut options: ContextMenuOptions) {
     // An unsupported presenter only adds failed setup work before the same
-    // classic menu would be shown; request the classic menu directly.
-    options.modern = options.modern && modern_presenter_supported() != Some(false);
+    // classic menu would be shown; request the classic menu directly. Only a
+    // known answer is applied here: the application decides before sending
+    // options to a menu worker, which must not hash the module again.
+    options.modern = options.modern && PRESENTER_SUPPORT.get().copied().flatten() != Some(false);
     options.hidden_verbs.retain(|v| !v.is_empty() && v.len() <= 128 && !v.contains('\0'));
     for verb in &mut options.hidden_verbs { verb.make_ascii_lowercase(); }
     options.hidden_verbs.sort(); options.hidden_verbs.dedup();

@@ -43,6 +43,8 @@ fn main() {
         if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;
     }
     let _lifetime = ApplicationLifetime::new();
+    // Runs while the session loads; windows then read a ready answer.
+    zsdesk_windows::shell::menu::prefetch_modern_presenter_support();
     if let Err(error)=app::run(){
         if app::is_import_cli() || app::is_background_mode() {
             eprintln!("{error:#}");

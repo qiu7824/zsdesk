@@ -88,11 +88,7 @@ pub fn prepare() {
         let _ = gfx.measure(CHECK, &TextStyle::icon(metrics.px(12.0)), 4096.0);
         if let Some(surface) = Surface::new(1, 1) { let _ = gfx.draw(&surface, |_| {}); }
     }
-    static DETECTION: std::sync::Once = std::sync::Once::new();
-    DETECTION.call_once(|| {
-        let _ = std::thread::Builder::new().name("zsdesk-menu-detection".into())
-            .spawn(|| { let _ = crate::shell::menu::modern_presenter_supported(); });
-    });
+    crate::shell::menu::prefetch_modern_presenter_support();
 }
 
 /// Re-reads the theme profile (dark mode, accent color, high contrast) after
@@ -473,7 +469,9 @@ pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> O
         SetCapture(root);
         SetTimer(Some(root), TIMER, 40, None);
     }
-    let foreground = unsafe { GetForegroundWindow() };
+    // Focus can be in transition while the menu opens; the first real
+    // foreground window is the one whose loss dismisses the menu.
+    let mut foreground = unsafe { GetForegroundWindow() };
     let mut start = POINT::default();
     let _ = unsafe { GetCursorPos(&mut start) };
     let drag = (unsafe { GetSystemMetrics(SM_CXDRAG) }.max(2), unsafe { GetSystemMetrics(SM_CYDRAG) }.max(2));
@@ -553,7 +551,11 @@ pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> O
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 pending = None;
                 let vk = VIRTUAL_KEY(msg.wParam.0 as u16);
-                if NAVIGATION_KEYS.contains(&vk) { key(&mut levels, vk, &gfx, colors, owner) }
+                // A held Shift+F10, menu key or Alt that opened the menu
+                // auto-repeats into it; only a fresh press dismisses.
+                let repeat = msg.lParam.0 & (1 << 30) != 0;
+                if repeat && matches!(vk, VK_APPS | VK_F10 | VK_MENU | VK_LWIN | VK_RWIN) { Step::Continue }
+                else if NAVIGATION_KEYS.contains(&vk) { key(&mut levels, vk, &gfx, colors, owner) }
                 else {
                     // Only character keys are translated (for mnemonics), so
                     // Enter/Esc/Space never leave a WM_CHAR for the owner.
@@ -567,7 +569,9 @@ pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> O
             },
             WM_KEYUP | WM_SYSKEYUP | WM_DEADCHAR | WM_SYSDEADCHAR => Step::Continue,
             WM_TIMER if msg.hwnd == root && msg.wParam.0 == TIMER => {
-                if !unsafe { IsWindow(Some(owner)) }.as_bool() || unsafe { GetForegroundWindow() } != foreground {
+                let now = unsafe { GetForegroundWindow() };
+                if foreground.0.is_null() { foreground = now; }
+                if !unsafe { IsWindow(Some(owner)) }.as_bool() || (!now.0.is_null() && now != foreground) {
                     Step::Dismiss
                 } else {
                     if let Some((depth, row, since)) = pending {
