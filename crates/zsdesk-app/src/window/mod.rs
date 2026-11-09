@@ -406,7 +406,7 @@ struct WindowState {
 impl WindowState {
     fn new(mut session: ExplorerSession, config_path: PathBuf, launch_selection: Option<std::ffi::OsString>, modern: bool) -> Self {
         if !modern{session.ui.context_menu.mode=zsdesk_core::model::explorer::ContextMenuMode::Original;}
-        let modern=session.ui.context_menu.mode==zsdesk_core::model::explorer::ContextMenuMode::Windows11;
+        let modern=crate::context_preferences::modern(&session.ui.context_menu);
         Self {
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
@@ -788,6 +788,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
     if msg==WM_APPCOMMAND&&mouse_navigation::app_command(hwnd,wp,lp){return LRESULT(1);}
     if msg==WM_TIMER&&wp.0==context_menu::TIMER{context_menu::poll(hwnd);return LRESULT(0);}
+    if msg!=0&&msg==crate::context_menu_process::progress_message(){context_menu::poll(hwnd);return LRESULT(0);}
     if msg == WM_NCHITTEST {
         if let Some(hit)=caption_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)}){return LRESULT(hit as isize);}
         if window_actions::fullscreen(hwnd) { return LRESULT(HTCLIENT as isize); }

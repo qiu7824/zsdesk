@@ -298,9 +298,18 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
 }
 
 pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec {
-    let original = options.mode == ContextMenuMode::Original;
+    context_menu_settings_menu_for(options, true)
+}
+
+/// `modern_available` is false where the Windows 11 presenter cannot run
+/// (Windows 10, or a system build the compatibility layer does not support):
+/// the menu then shows the classic style that is actually used.
+pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, modern_available: bool) -> MenuSpec {
+    let original = options.mode == ContextMenuMode::Original || !modern_available;
+    let modern = if modern_available { entry("Windows 11 原生菜单", "context-menu-windows11", true, !original) }
+        else { entry("Windows 11 原生菜单（当前系统版本不可用）", "context-menu-windows11", false, false) };
     menu(vec![
-        entry("Windows 11 原生菜单", "context-menu-windows11", true, !original),
+        modern,
         entry("经典系统菜单", "context-menu-original", true, original),
         MenuItemSpec::Separator,
         submenu("显示的命令", vec![
@@ -346,6 +355,8 @@ pub struct AppMenuState {
     pub desktop_running: Option<bool>,
     /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
     pub integration: u8,
+    /// The Windows 11 menu presenter cannot run on this system.
+    pub modern_menu_unavailable: bool,
 }
 
 /// Application menu (≡) next to the window buttons.
@@ -363,7 +374,8 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         MenuItemSpec::Separator,
     ];
     items.extend(interface_settings_menu(ui).items);
-    items.push(group("右键菜单", "settings-context-menu", context_menu_settings_menu(&ui.context_menu).items));
+    items.push(group("右键菜单", "settings-context-menu",
+        context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
     if themed { items.push(group("主题与材质", "settings-appearance", appearance_menu(&ui.appearance).items)); }
     if let Some(running) = state.desktop_running {
         items.push(group("桌面格子", "settings-desktop", vec![
@@ -566,6 +578,17 @@ mod tests {
         }
         assert!(!options.show_wps);
         assert!(options.show_seven_zip);
+    }
+
+    #[test]
+    fn unavailable_windows11_menu_shows_the_classic_menu_in_use() {
+        let options = ContextMenuPreferences::default();
+        let spec = context_menu_settings_menu_for(&options, false);
+        let checked: Vec<_> = spec.items.iter().filter_map(|item| match item {
+            MenuItemSpec::Command { checked: true, command: UiCommand::Custom { id, .. }, .. } => Some(id.as_str()), _ => None }).collect();
+        assert_eq!(checked, ["context-menu-original"]);
+        assert!(!nested_ids(&spec).contains(&"context-menu-windows11".to_string()), "the unavailable style is not selectable");
+        assert!(nested_ids(&spec).contains(&"context-action-wps".to_string()), "command visibility stays editable");
     }
 
     #[test]

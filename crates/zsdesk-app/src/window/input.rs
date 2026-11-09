@@ -540,6 +540,7 @@ impl WindowState {
             forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
+            modern_menu_unavailable: zsdesk_windows::shell::menu::modern_presenter_supported()==Some(false),
         };
         let anchor = Some(self.layout.app_menu);
         // The menu shows the effective navigation expansion (system default included).
@@ -563,7 +564,7 @@ impl WindowState {
             Some(id) if id.starts_with("appearance-") => if crate::edition::THEMED { self.apply_appearance_choice(id); },
             Some(id) if id.starts_with("context-menu-") || id.starts_with("context-action-") => {
                 if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
-                    self.modern=self.session.ui.context_menu.mode==zsdesk_core::model::explorer::ContextMenuMode::Windows11;
+                    self.modern=crate::context_preferences::modern(&self.session.ui.context_menu);
                     let options=crate::context_preferences::native(&self.session.ui.context_menu);
                     zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
                     if let Some(browser)=&self.browser{browser.set_context_menu_options(options);}
