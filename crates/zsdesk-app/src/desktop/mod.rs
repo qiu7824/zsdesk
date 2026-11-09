@@ -78,7 +78,7 @@ use windows::{
 use zsdesk_ui::menus::{MenuItemSpec, MenuSpec, UiCommand};
 use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, MenuInterceptions, MenuOutcome, ShellMenu, APP_FIRST}, notify::read_change}};
 
-use host::{After, DesktopHost, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
+use host::{After, DesktopHost, TIMER_AUTOSCROLL, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
     WM_ICON_READY, WM_RENAME_DONE, WM_TRAY};
 
 const HOST_CLASS: &str = "ZSDesk.Native.DesktopHost";
@@ -512,6 +512,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_PEEK => { with_host(|h| h.peek_check(id)); return LRESULT(0); }
+        WM_TIMER if wp.0 == TIMER_AUTOSCROLL => { with_host(|h| h.rubber_autoscroll(id)); return LRESULT(0); }
         WM_TIMER if wp.0 == TIMER_FOLDER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_FOLDER) };
             if with_host(|h| h.refresh_folder(id)).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_FOLDER, 500, None); } }
@@ -897,26 +898,33 @@ fn run_verb(fence: u64, verb: &'static str, background: bool) {
 fn insert_top(hmenu: HMENU, items: &[MenuItemSpec]) -> Vec<String> {
     let mut ids = Vec::new();
     let mut position = 0u32;
-    for item in items { insert_item(hmenu, &mut position, item, &mut ids); }
+    for item in items { insert_item_with_icons(hmenu, &mut position, item, &mut ids, None); }
     if !items.is_empty() { unsafe { let _ = InsertMenuW(hmenu, position, MF_BYPOSITION | MF_SEPARATOR, 0, None); } }
     ids
 }
 
-fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut Vec<String>) {
+fn insert_item_with_icons(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut Vec<String>,
+    mut icons: Option<&mut zsdesk_windows::menu_icons::MenuIcons>) {
     match item {
         MenuItemSpec::Command { label, command: UiCommand::Custom { id, .. }, checked, enabled, .. } => {
             let command = APP_FIRST as usize + ids.len();
             ids.push(id.clone());
             let flags = MF_BYPOSITION | MF_STRING | if *checked { MF_CHECKED } else { MF_UNCHECKED } | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            unsafe { let _ = InsertMenuW(hmenu, *position, flags, command, PCWSTR(wide(label).as_ptr())); }
+            let added = unsafe { InsertMenuW(hmenu, *position, flags, command, PCWSTR(wide(label).as_ptr())) }.is_ok();
+            if let (Some(icons), Some(glyph)) = (icons, zsdesk_ui::menus::command_glyph(id).filter(|_| added && !*checked)) {
+                icons.attach(hmenu, *position, true, glyph, *enabled);
+            }
             *position += 1;
         }
-        MenuItemSpec::Submenu { label, menu, enabled, .. } => {
+        MenuItemSpec::Submenu { id, label, menu, enabled } => {
             let Ok(sub) = (unsafe { CreatePopupMenu() }) else { return };
             let mut inner = 0u32;
-            for child in &menu.items { insert_item(sub, &mut inner, child, ids); }
+            for child in &menu.items { insert_item_with_icons(sub, &mut inner, child, ids, icons.as_deref_mut()); }
             let flags = MF_BYPOSITION | MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            unsafe { let _ = InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())); }
+            let added = unsafe { InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) }.is_ok();
+            if let (Some(icons), Some(glyph)) = (icons, id.as_deref().and_then(zsdesk_ui::menus::command_glyph).filter(|_| added)) {
+                icons.attach(hmenu, *position, true, glyph, *enabled);
+            }
             *position += 1;
         }
         MenuItemSpec::Separator => {
@@ -929,8 +937,10 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
 
 /// Plain popup for a ZSUI menu spec.
 fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
+    // Declared before the menu so its bitmaps outlive DestroyMenu.
+    let mut icons = zsdesk_windows::menu_icons::MenuIcons::new(owner);
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item(menu, &mut p, item, &mut ids); } ids };
+    let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item_with_icons(menu, &mut p, item, &mut ids, Some(&mut icons)); } ids };
     let chosen = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, None, owner, None) }.0 as u32;
     let _ = unsafe { DestroyMenu(menu) };
     chosen.checked_sub(APP_FIRST).and_then(|i| ids.get(i as usize)).cloned()

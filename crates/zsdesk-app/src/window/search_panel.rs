@@ -126,7 +126,8 @@ impl WindowState {
         let layout = &self.layout.search_panel;
         if !self.search_panel.open || layout.card.is_empty() { return; }
         let controls = self.search_controls();
-        let fence = FencePalette::new(if self.dark { Mode::Dark } else { Mode::Light }, 100);
+        let mut fence = FencePalette::new(if self.dark { Mode::Dark } else { Mode::Light }, 100);
+        if let Some(accent) = zsdesk_windows::theme::system_accent(self.dark) { fence = fence.with_accent(accent); }
         let text = color(fence.text);
         let secondary = color(fence.text_secondary);
         let accent = color(fence.accent);

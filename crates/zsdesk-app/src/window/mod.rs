@@ -623,6 +623,7 @@ impl WindowState {
             else {zsdesk_core::model::explorer::AppearancePreferences::default()};
         self.dark = theme::configure_color_scheme(prefs.color_scheme);
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
+        if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
         theme::set_dark_frame(self.hwnd, self.dark);
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);

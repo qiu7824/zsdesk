@@ -11,6 +11,8 @@ pub mod gfx;
 #[cfg(windows)]
 pub mod integration;
 #[cfg(windows)]
+pub mod menu_icons;
+#[cfg(windows)]
 pub mod ole;
 #[cfg(windows)]
 pub mod shell;

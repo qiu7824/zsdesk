@@ -257,7 +257,7 @@ pub(super) fn ensure_running(configured:Option<&Path>,cancel:&impl Fn()->bool,al
     if fs::symlink_metadata(marker(&root)).is_ok(){let _=fs::remove_file(marker(&root));}
     let executable=bundle()?;
     if !allow_setup&&!can_index()&&!explicit_folders(&root.join("Everything.ini")){
-        bail!("未发现兼容的 Everything 1.4 索引服务；请在“界面设置 → Everything 搜索 → 启用快速索引服务”中启用 ZSdesk 专用服务。版本不明或 1.5 的服务不会复用，也不会改用全盘文件夹扫描");
+        bail!("未发现兼容的 Everything 1.4 索引服务；请在“≡ → 搜索 → 启用快速索引服务…”中启用 ZSdesk 专用服务。版本不明或 1.5 的服务不会复用，也不会改用全盘文件夹扫描");
     }
     write_config(&root)?;
     let instance=instance_name();let mut launch=command(&executable);
@@ -301,7 +301,7 @@ pub(super) fn wait_ready(connection:&Connection,cancel:&impl Fn()->bool,pending:
     // Check once per query before accepting an already-loaded empty database.
     // Resource/version checks must not repeat in the 50 ms readiness loop.
     if connection.managed&&ipc(connection.hwnd,403,0).unwrap_or(0)==0&&service_pipe().is_none()
-        &&!root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))){bail!("未发现兼容的 Everything 1.4 索引服务，请在“界面设置 → Everything 搜索 → 启用快速索引服务”中启用 ZSdesk 专用服务；版本不明或 1.5 的服务不会复用");}
+        &&!root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))){bail!("未发现兼容的 Everything 1.4 索引服务，请在“≡ → 搜索 → 启用快速索引服务…”中启用 ZSdesk 专用服务；版本不明或 1.5 的服务不会复用");}
     wait_for_ready(||Ok(ipc(connection.hwnd,401,0)?!=0),cancel,pending,Duration::from_secs(120))
 }
 fn wait_for_ready(mut loaded:impl FnMut()->Result<bool>,cancel:&impl Fn()->bool,pending:&mut dyn FnMut(),budget:Duration)->Result<()>{
