@@ -12,7 +12,7 @@ use windows::{
         Foundation::{HMODULE, HWND, RECT},
         Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
             DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMSBT_MAINWINDOW},
-        System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ}},
+        System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ}},
         UI::{Controls::{SetWindowTheme, MARGINS}},
     },
 };
@@ -54,9 +54,16 @@ fn uxtheme_ordinal(ordinal: usize) -> Option<unsafe extern "system" fn() -> isiz
     unsafe { GetProcAddress(module, PCSTR(ordinal as *const u8)) }
 }
 
+static MENUS_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process's application menus use the dark theme (the file
+/// window's color scheme, as last applied).
+pub fn menus_dark() -> bool { MENUS_DARK.load(std::sync::atomic::Ordering::Relaxed) && !high_contrast() }
+
 /// Lets Shell views, trees and menus in this process use dark visuals.
 pub fn allow_dark_mode(dark: bool) {
     let dark=dark&&!high_contrast();
+    MENUS_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
     if let Some(proc) = uxtheme_ordinal(135) {
         let set: SetPreferredAppMode = unsafe { std::mem::transmute(proc) };
         unsafe { set(if dark { 1 } else { 0 }); }
@@ -67,19 +74,65 @@ pub fn allow_dark_mode(dark: bool) {
     }
 }
 
+/// Windows 10 Shell views (DefView, its search results and the items view)
+/// turn dark only when the process forces dark mode; allowing it, which is
+/// enough on Windows 11, leaves them white. Views created under one forced
+/// mode keep it until they are recreated.
+pub fn views_need_forced_mode() -> bool { os_build() < 22000 }
+
+/// `SetPreferredAppMode` value: 1 AllowDark (follow the system), 2 ForceDark,
+/// 3 ForceLight. "Follow the system" is resolved to a forced mode where the
+/// Shell views would otherwise ignore a dark system theme.
+pub fn preferred_app_mode(scheme: zsdesk_core::model::explorer::ColorScheme, system_dark: bool, forced_views: bool) -> i32 {
+    use zsdesk_core::model::explorer::ColorScheme;
+    match scheme {
+        ColorScheme::System if forced_views => if system_dark { 2 } else { 3 },
+        ColorScheme::System => 1,
+        ColorScheme::Dark => 2,
+        ColorScheme::Light => 3,
+    }
+}
+
+type RefreshImmersiveColorPolicyState = unsafe extern "system" fn();
+
 /// Configures process-local Shell colors without changing Windows preferences.
 pub fn configure_color_scheme(scheme: zsdesk_core::model::explorer::ColorScheme) -> bool {
     if high_contrast(){allow_dark_mode(false);return false;}
     use zsdesk_core::model::explorer::ColorScheme;
-    let dark = match scheme { ColorScheme::System => system_dark_mode(), ColorScheme::Light => false, ColorScheme::Dark => true };
+    let system_dark = system_dark_mode();
+    let dark = match scheme { ColorScheme::System => system_dark, ColorScheme::Light => false, ColorScheme::Dark => true };
+    MENUS_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
     if let Some(proc) = uxtheme_ordinal(135) {
         let set: SetPreferredAppMode = unsafe { std::mem::transmute(proc) };
-        unsafe { set(match scheme { ColorScheme::System => 1, ColorScheme::Dark => 2, ColorScheme::Light => 3 }); }
+        unsafe { set(preferred_app_mode(scheme, system_dark, views_need_forced_mode())); }
+    }
+    // Re-read the cached system policy so windows created next use the mode.
+    if let Some(proc) = uxtheme_ordinal(104) {
+        let refresh: RefreshImmersiveColorPolicyState = unsafe { std::mem::transmute(proc) }; unsafe { refresh(); }
     }
     if let Some(proc) = uxtheme_ordinal(136) {
         let flush: FlushMenuThemes = unsafe { std::mem::transmute(proc) }; unsafe { flush(); }
     }
     dark
+}
+
+/// The user's accent color ("Personalization → Colors") in the shade WinUI
+/// uses for accent fills: `SystemAccentColorDark1` on light surfaces and
+/// `SystemAccentColorLight2` on dark ones. `None` keeps the Fluent default.
+pub fn system_accent(dark: bool) -> Option<[u8; 3]> {
+    if high_contrast() { return None; }
+    let mut palette = [0u8; 32];
+    let mut size = palette.len() as u32;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent"),
+        w!("AccentPalette"), RRF_RT_REG_BINARY, None, Some(palette.as_mut_ptr().cast()), Some(&mut size)) }.ok().ok()?;
+    accent_shade(&palette[..(size as usize).min(palette.len())], dark)
+}
+
+/// `AccentPalette` holds eight RGBA entries: Light3, Light2, Light1, Accent, Dark1, Dark2, Dark3, …
+fn accent_shade(palette: &[u8], dark: bool) -> Option<[u8; 3]> {
+    if palette.len() < 32 { return None; }
+    let index = if dark { 1 } else { 4 };
+    Some([palette[index * 4], palette[index * 4 + 1], palette[index * 4 + 2]])
 }
 
 pub fn high_contrast()->bool{
@@ -178,4 +231,31 @@ pub fn caption_button_bounds(hwnd: HWND) -> Option<RECT> {
     let mut rect = RECT::default();
     unsafe { DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, (&mut rect as *mut RECT).cast(), std::mem::size_of::<RECT>() as u32) }.ok()?;
     (rect.right > rect.left).then_some(rect)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn following_the_system_forces_the_mode_where_shell_views_need_it() {
+        use zsdesk_core::model::explorer::ColorScheme;
+        // Windows 10: DefView (folders and search results) ignores AllowDark.
+        assert_eq!(super::preferred_app_mode(ColorScheme::System, true, true), 2);
+        assert_eq!(super::preferred_app_mode(ColorScheme::System, false, true), 3);
+        // Windows 11 keeps following the system theme by itself.
+        assert_eq!(super::preferred_app_mode(ColorScheme::System, true, false), 1);
+        for forced in [false, true] {
+            assert_eq!(super::preferred_app_mode(ColorScheme::Dark, false, forced), 2);
+            assert_eq!(super::preferred_app_mode(ColorScheme::Light, true, forced), 3);
+        }
+    }
+
+    #[test]
+    fn accent_palette_uses_winui_shades() {
+        // Windows 11 default blue palette.
+        let palette: Vec<u8> = [0x99EBFFu32, 0x4CC2FF, 0x0091F8, 0x0078D4, 0x0067C0, 0x003E92, 0x001A68, 0xF7630C]
+            .iter().flat_map(|rgb| [(rgb >> 16) as u8, (rgb >> 8) as u8, *rgb as u8, 0]).collect();
+        assert_eq!(super::accent_shade(&palette, false), Some([0x00, 0x67, 0xC0]));
+        assert_eq!(super::accent_shade(&palette, true), Some([0x4C, 0xC2, 0xFF]));
+        assert_eq!(super::accent_shade(&palette[..16], true), None);
+    }
 }

@@ -662,7 +662,7 @@ fn worker_loop(path: PathBuf, roots_override: Option<Vec<PathBuf>>, shared: Arc<
                     let free:i64=db.connection.query_row("PRAGMA freelist_count",[],|row|row.get(0))?;
                     if control.action!=ScanAction::Rebuild && pages-free>=MAX_DATABASE_PAGES-32 {
                         started=true;paused=true;db.stats.scanning=false;
-                        maintenance_error=Some("本机索引已达到 1 GiB 容量上限，维护已暂停；当前结果仅覆盖已收录文件，可在界面设置中选择 Everything。".into());
+                        maintenance_error=Some("本机索引已达到 1 GiB 容量上限，维护已暂停；当前结果仅覆盖已收录文件，可在“≡ → 搜索 → 选择已安装的 Everything…”中指定。".into());
                     } else {
                     current = None; active = None; cache = None;
                     shared.trace(7);

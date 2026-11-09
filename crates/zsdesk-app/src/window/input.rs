@@ -1,5 +1,5 @@
 use super::*;
-use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey, UiCommand}};
+use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey}};
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 impl WindowState {
@@ -397,6 +397,11 @@ impl WindowState {
         if !details_changed {unsafe{self.resize();}return;}
         // IExplorerBrowser reads pane visibility only while initializing, so the
         // view is recreated and returns to the same folder, selection and layout.
+        self.recreate_browser("无法切换窗格");
+    }
+
+    /// Rebuilds the active Shell view in place: same folder, selection and layout.
+    fn recreate_browser(&mut self, failure: &str) {
         unsafe { self.capture_active(); }
         self.folder_sizes.cancel();self.cancel_fast_search();self.browser = None;self.browser_role=BrowserRole::Fresh;
         self.pending = None;
@@ -405,13 +410,21 @@ impl WindowState {
         let created=self.create_browser();
         match created {
             Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);},
-            Err(error) => self.show_message(format!("无法切换窗格：{error}")),
+            Err(error) => self.show_message(format!("{failure}：{error}")),
         }
         self.icons.clear();
         unsafe { self.resize(); }
         self.theme_children();
         unsafe { self.navigate_current(); }
         self.invalidate_rect(self.layout.command_row);
+    }
+
+    /// On Windows 10 a Shell view keeps the dark/light mode it was created
+    /// with, so both panes are rebuilt when the effective theme flips.
+    pub(super) fn rebuild_views_for_theme(&mut self) {
+        if !zsdesk_windows::theme::views_need_forced_mode() { return; }
+        self.recreate_browser("无法更新文件视图配色");
+        self.rebuild_other_pane();
     }
 
     fn set_view(&mut self, choice: Option<menus::ViewChoice>) {
@@ -483,6 +496,11 @@ impl WindowState {
         if let Some(id)=choice.as_deref(){if unsafe{self.apply_search_option(id)}{return;}}
         let hwnd = self.hwnd;
         match choice.as_deref() {
+            Some("undo") => {
+                let view = self.browser.as_ref().and_then(|b| unsafe { b.current_view() }.ok());
+                let result = view.map(|view| keyboard::execute(&view, hwnd, keyboard::FileShortcut::Undo));
+                self.shell_result(result);
+            }
             Some("select-all") => if let Some(b) = &self.browser { b.select_all(true) },
             Some("select-none") => if let Some(b) = &self.browser { b.select_all(false) },
             Some("select-invert") => {
@@ -495,7 +513,7 @@ impl WindowState {
                 let r = self.browser.as_ref().map(|b| if self.view_status.selected > 0 { b.invoke_selection(hwnd, "properties", false) } else { b.invoke_background(hwnd, "properties") });
                 self.shell_result(r);
             }
-            Some("folder-options") => open_folder_options(),
+            Some("options") => open_folder_options(),
             Some("map-drive") if crate::edition::NETWORK => {
                 use windows::Win32::NetworkManagement::WNet::{WNetConnectionDialog, RESOURCETYPE_DISK};
                 let _ = unsafe { WNetConnectionDialog(hwnd, RESOURCETYPE_DISK.0) };
@@ -535,83 +553,35 @@ impl WindowState {
             forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
+            modern_menu_unavailable: zsdesk_windows::shell::menu::modern_presenter_supported()==Some(false),
         };
         let anchor = Some(self.layout.app_menu);
-        let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, crate::edition::THEMED), anchor);
+        // The menu shows the effective navigation expansion (system default included).
+        let mut menu_ui=self.session.ui.clone();
+        menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
+        let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED), anchor);
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Some("new-window")=>self.new_window(),
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(format!("无法打开诊断日志：{error}"));},
-            Some("quick-search") => unsafe{self.execute(Command::FocusSearch)},
-            Some("quick-search-window") => unsafe { self.open_integrated_search(); },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
-            Some(id @ ("search-index-settings" | "search-everything-service")) => { self.search_engine_menu_action(id); },
-            Some("appearance-settings") if crate::edition::THEMED => {
-                if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
-                let old=self.session.ui.appearance.clone();
-                let spec=menus::appearance_menu(&old);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)) {
-                    if menus::apply_appearance(&mut self.session.ui.appearance,&id) {
-                        self.apply_theme();self.theme_children();
-                        if old.color_scheme!=self.session.ui.appearance.color_scheme {
-                            self.set_panes(self.session.ui.show_preview,self.session.ui.show_details);
-                        }
-                        self.save();self.relayout();self.position_children();self.invalidate();
-                        let _=crate::quick_search::control::signal(&self.config_path,"reload");
-                    }
+            Some("search-rebuild-index") => self.rebuild_search_index(),
+            Some("dual-pane") => self.toggle_dual_pane(),
+            Some(id) if self.search_engine_menu_action(id) => {},
+            Some("search-everything-program") => {
+                match crate::fast_search::everything::choose_executable(self.hwnd){
+                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.save();self.search_backend_changed();},
+                    Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
-            Some("search-rebuild-index") => {
-                self.rebuild_search_index();
-            },
-            Some("interface-settings") => {
-                let mut menu_ui=self.session.ui.clone();
-                menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
-                let spec=menus::interface_settings_menu(&menu_ui);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
-                    if id=="dual-pane" {self.toggle_dual_pane();return;}
-                    if self.search_engine_menu_action(&id) { return; }
-                    if menus::interface_requires_dialog(&id){
-                        match crate::fast_search::everything::choose_executable(self.hwnd){
-                            Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.save();self.search_backend_changed();},
-                            Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
-                        }return;
-                    }
-                    if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
-                    if menus::apply_interface_setting(&mut self.session.ui,&id){
-                        if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
-                        if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
-                        self.crumbs_for=None;
-                        if id=="search-all-files" || id=="search-current-folder"{
-                            let scope=if self.session.ui.search_all_files{None}else{
-                                self.search_scope.as_ref().unwrap_or_else(||self.current_location()).as_path().map(PathBuf::from)
-                            };
-                            self.search_controls_mut().scope=scope;
-                            unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
-                        }
-                        self.save();self.measure_bookmarks();self.relayout();self.position_children();
-                        if id=="everything-folder-sizes" {self.poll_folder_sizes();}
-                        if id.starts_with("search-backend-"){self.search_backend_changed();}
-                        if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
-                            if let Some(tree)=&self.tree {
-                                let location=self.current_location();
-                                if !matches!(location,ShellLocation::Search{..}) { unsafe {tree.select_location_with_policy(location,self.navigation_auto_expand());} }
-                            }
-                        }
-                        unsafe{self.update_address();}self.invalidate();
-                    }
-                }
-            },
-            Some("context-menu-settings") => {
-                let spec=menus::context_menu_settings_menu(&self.session.ui.context_menu);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
-                    if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,&id){
-                        self.modern=self.session.ui.context_menu.mode==zsdesk_core::model::explorer::ContextMenuMode::Windows11;
-                        let options=crate::context_preferences::native(&self.session.ui.context_menu);
-                        zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
-                        if let Some(browser)=&self.browser{browser.set_context_menu_options(options);}
-                        self.save();
-                    }
+            Some(id) if id.starts_with("appearance-") => if crate::edition::THEMED { self.apply_appearance_choice(id); },
+            Some(id) if id.starts_with("context-menu-") || id.starts_with("context-action-") => {
+                if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
+                    self.modern=crate::context_preferences::modern(&self.session.ui.context_menu);
+                    let options=crate::context_preferences::native(&self.session.ui.context_menu);
+                    zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
+                    if let Some(browser)=&self.browser{browser.set_context_menu_options(options);}
+                    self.save();
                 }
             },
             Some("routing-settings") => self.show_routing_settings(),
@@ -627,6 +597,10 @@ impl WindowState {
             Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
+            Some(id) if menus::apply_interface_setting(&mut self.session.ui.clone(), id) => {
+                if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
+                self.apply_interface_choice(id);
+            },
             Some("shortcuts") => {
                 let text = if crate::edition::DESKTOP { SHORTCUTS } else { SHORTCUTS.split("\n\n桌面格子").next().unwrap_or(SHORTCUTS) };
                 let text = wide(text);
@@ -641,6 +615,42 @@ impl WindowState {
             }
             _ => {}
         }
+    }
+
+    fn apply_appearance_choice(&mut self, id: &str) {
+        if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
+        let old=self.session.ui.appearance.clone();
+        if !menus::apply_appearance(&mut self.session.ui.appearance,id) || self.session.ui.appearance==old { return; }
+        let was_dark=self.dark;
+        self.apply_theme();self.theme_children();
+        if was_dark!=self.dark { self.rebuild_views_for_theme(); }
+        self.save();self.relayout();self.position_children();self.invalidate();
+        let _=crate::quick_search::control::signal(&self.config_path,"reload");
+    }
+
+    /// Applies an interface preference chosen in ≡ and refreshes what it affects.
+    fn apply_interface_choice(&mut self, id: &str) {
+        if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
+        if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
+        if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
+        self.crumbs_for=None;
+        if id=="search-all-files" || id=="search-current-folder"{
+            let scope=if self.session.ui.search_all_files{None}else{
+                self.search_scope.as_ref().unwrap_or_else(||self.current_location()).as_path().map(PathBuf::from)
+            };
+            self.search_controls_mut().scope=scope;
+            unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
+        }
+        self.save();self.measure_bookmarks();self.relayout();self.position_children();
+        if id=="everything-folder-sizes" {self.poll_folder_sizes();}
+        if id.starts_with("search-backend-"){self.search_backend_changed();}
+        if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
+            if let Some(tree)=&self.tree {
+                let location=self.current_location();
+                if !matches!(location,ShellLocation::Search{..}) { unsafe {tree.select_location_with_policy(location,self.navigation_auto_expand());} }
+            }
+        }
+        unsafe{self.update_address();}self.invalidate();
     }
 
     /// Index administration is reached only through explicit menu actions.
@@ -658,7 +668,7 @@ impl WindowState {
         use zsdesk_windows::integration::{self, Integration};
         let level = match id { "integration-context" => Integration::ContextMenu, "integration-default" => Integration::Default, _ => Integration::Off };
         if level == Integration::Default {
-            let text = wide("Win+E、文件夹、磁盘和桌面“此电脑”将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在 ≡ → 系统集成 → 恢复系统资源管理器 中还原。\n\n继续？");
+            let text = wide("Win+E、文件夹、磁盘和桌面“此电脑”将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在 ≡ → 系统集成 → 不接管系统资源管理器 中还原。\n\n继续？");
             if unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("默认用 ZSDesk 打开").as_ptr()), MB_OKCANCEL | MB_ICONQUESTION) } != IDOK { return; }
         }
         let Ok(exe) = std::env::current_exe() else { return };
@@ -773,42 +783,17 @@ pub(super) fn set_clipboard_text(owner: HWND, text: &str) {
     }
 }
 
-/// Shows a ZSUI menu spec as a native popup. `anchor` (client rect) places it below a button.
+/// Shows a ZSUI menu spec as a Windows 11 style flyout. `anchor` (client
+/// rect) places it below a button; otherwise it opens at the cursor.
 pub(super) fn popup(owner: HWND, spec: &MenuSpec, anchor: Option<LayoutRect>) -> Option<String> {
-    let mut ids: Vec<String> = Vec::new();
-    let menu = build_menu(spec, &mut ids)?;
-    let mut pt = POINT::default();
-    let mut flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
-    if let Some(r) = anchor {
-        pt = POINT { x: r.x, y: r.bottom() };
-        let _ = unsafe { ClientToScreen(owner, &mut pt) };
-        flags |= TPM_LEFTALIGN | TPM_TOPALIGN;
-    } else {
-        let _ = unsafe { GetCursorPos(&mut pt) };
-    }
-    let selected = unsafe { TrackPopupMenu(menu, flags, pt.x, pt.y, None, owner, None) }.0;
-    let _ = unsafe { DestroyMenu(menu) };
-    selected.checked_sub(1).and_then(|i| ids.get(i as usize)).cloned()
-}
-
-fn build_menu(spec: &MenuSpec, ids: &mut Vec<String>) -> Option<HMENU> {
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    for item in &spec.items {
-        match item {
-            MenuItemSpec::Command { label, command: UiCommand::Custom { id, .. }, checked, enabled, .. } => {
-                ids.push(id.clone());
-                let flags = MF_STRING | if *checked { MF_CHECKED } else { MF_UNCHECKED } | if *enabled { MF_ENABLED } else { MF_GRAYED };
-                let _ = unsafe { AppendMenuW(menu, flags, ids.len(), PCWSTR(wide(label).as_ptr())) };
-            }
-            MenuItemSpec::Submenu { label, menu: inner, enabled, .. } => {
-                if let Some(sub) = build_menu(inner, ids) {
-                    let flags = MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-                    let _ = unsafe { AppendMenuW(menu, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) };
-                }
-            }
-            MenuItemSpec::Separator => { let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, None) }; }
-            _ => {}
+    use crate::flyout_menu::{MenuAnchor, MenuBounds};
+    let anchor = match anchor {
+        Some(r) => {
+            let mut corners = [POINT { x: r.x, y: r.y }, POINT { x: r.right(), y: r.bottom() }];
+            for corner in &mut corners { let _ = unsafe { ClientToScreen(owner, corner) }; }
+            MenuAnchor::Below(MenuBounds::new(corners[0].x, corners[0].y, corners[1].x, corners[1].y))
         }
-    }
-    Some(menu)
+        None => { let mut point = POINT::default(); let _ = unsafe { GetCursorPos(&mut point) }; MenuAnchor::Point { x: point.x, y: point.y } }
+    };
+    crate::flyout_menu::show(owner, spec, anchor, zsdesk_windows::theme::menus_dark())
 }

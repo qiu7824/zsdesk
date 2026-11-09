@@ -339,8 +339,17 @@ impl WindowState {
                 cv.line(header.x as f32,header.bottom()as f32-1.0,header.right()as f32,header.bottom()as f32-1.0,
                     c(if active{p.accent}else{p.divider}),if active{2.0}else{1.0});
             }
-            let split=l.pane_splitter;
-            cv.fill(rf(split),c(if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some(){p.hover}else{p.layer}));
+            // A hairline divider like Windows 11 split views; the full gap stays
+            // the drag target and shows a grip while hovered or dragged.
+            let split=rf(l.pane_splitter);
+            cv.fill(split,c(p.content));
+            let middle=(split.x+split.w/2.0).floor()+0.5;
+            if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some() {
+                let grip=self.sf(3.0);
+                cv.round(RectF::new(middle-grip/2.0,split.y,grip,split.h),grip/2.0,c(p.text_secondary).with_alpha(0.55));
+            } else {
+                cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
+            }
         }
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
@@ -358,7 +367,8 @@ impl WindowState {
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End), c(p.danger));
+            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+                c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }
         let r = rf(l.status);
@@ -375,10 +385,11 @@ impl WindowState {
         if !self.status.is_empty() || self.search_progress.is_some() {
             let x = left + w + self.sf(24.0);
             let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
+            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
+                c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
         let (mode, _) = self.view_mode;
-        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,"\u{E8A9}",self.session.ui.dual_pane),
+        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,glyph::DUAL_PANE,self.session.ui.dual_pane),
             (l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
@@ -493,5 +504,22 @@ mod icon_geometry_tests {
             }
             if width >= 70 { assert!(slots.iter().any(|slot| slot.part == CrumbPart::Crumb(2))); }
         }}}
+    }
+}
+
+/// Status text that reports a failure is drawn in the critical color; progress
+/// and confirmations ("已复制 3 个路径") stay neutral.
+fn status_is_error(text: &str) -> bool {
+    ["失败", "无法", "错误", "未找到", "不支持", "未保存", "未更新", "未启动", "异常", "超时", "需要修复"].iter().any(|word| text.contains(word))
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn confirmations_are_not_painted_as_errors() {
+        assert!(!super::status_is_error("已复制 3 个路径"));
+        assert!(!super::status_is_error("下次登录 Windows 时将启动桌面格子"));
+        assert!(super::status_is_error("操作失败：拒绝访问"));
+        assert!(super::status_is_error("无法预览：文件被占用"));
     }
 }

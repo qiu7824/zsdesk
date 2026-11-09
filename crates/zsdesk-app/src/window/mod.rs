@@ -406,7 +406,7 @@ struct WindowState {
 impl WindowState {
     fn new(mut session: ExplorerSession, config_path: PathBuf, launch_selection: Option<std::ffi::OsString>, modern: bool) -> Self {
         if !modern{session.ui.context_menu.mode=zsdesk_core::model::explorer::ContextMenuMode::Original;}
-        let modern=session.ui.context_menu.mode==zsdesk_core::model::explorer::ContextMenuMode::Windows11;
+        let modern=crate::context_preferences::modern(&session.ui.context_menu);
         Self {
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
@@ -446,6 +446,8 @@ impl WindowState {
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
         self.gfx = Some(Gfx::new(&family).context("Direct2D 初始化失败")?);
+        // Menus are drawn, not created by Win32: prepare them before first use.
+        zsdesk_windows::flyout::prepare();
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
         self.search_edit = unsafe { child(hwnd, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true)? };
         for (edit, id) in [(self.address_edit, ID_ADDRESS), (self.search_edit, ID_SEARCH)] {
@@ -622,7 +624,9 @@ impl WindowState {
         let prefs=if crate::edition::THEMED {self.session.ui.appearance.clone()}
             else {zsdesk_core::model::explorer::AppearancePreferences::default()};
         self.dark = theme::configure_color_scheme(prefs.color_scheme);
+        zsdesk_windows::flyout::refresh_system();
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
+        if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
         theme::set_dark_frame(self.hwnd, self.dark);
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);
@@ -641,7 +645,10 @@ impl WindowState {
     fn refresh_system_theme(&mut self){
         // A changed caption/frame mode invalidates an in-progress press.
         unsafe{SendMessageW(self.hwnd,WM_CANCELMODE,None,None);}
+        let was_dark=self.dark;
         self.apply_theme();self.theme_children();
+        // Following a system switch between light and dark.
+        if was_dark!=self.dark { self.rebuild_views_for_theme(); }
         self.relayout();self.position_children();self.invalidate();
     }
 
@@ -787,6 +794,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
     if msg==WM_APPCOMMAND&&mouse_navigation::app_command(hwnd,wp,lp){return LRESULT(1);}
     if msg==WM_TIMER&&wp.0==context_menu::TIMER{context_menu::poll(hwnd);return LRESULT(0);}
+    if msg!=0&&msg==crate::context_menu_process::progress_message(){context_menu::poll(hwnd);return LRESULT(0);}
     if msg == WM_NCHITTEST {
         if let Some(hit)=caption_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)}){return LRESULT(hit as isize);}
         if window_actions::fullscreen(hwnd) { return LRESULT(HTCLIENT as isize); }
