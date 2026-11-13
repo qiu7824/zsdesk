@@ -263,7 +263,8 @@ pub(super) fn poll(owner:HWND){
         let target=root.join("子目录");std::fs::create_dir(&target)?;let file=root.join("file.txt");std::fs::write(&file,b"fixture")?;
         let folder=zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(target.clone())).context("folder PIDL")?;
         let plain=zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(file)).context("file PIDL")?;
-        assert_eq!(selected_paste_destination(&[folder.clone()]),Some(target));assert!(selected_paste_destination(&[plain.clone()]).is_none());
+        let actual=selected_paste_destination(&[folder.clone()]).context("selected folder destination")?;
+        assert_eq!(std::fs::canonicalize(actual)?,std::fs::canonicalize(target)?);assert!(selected_paste_destination(&[plain.clone()]).is_none());
         assert!(selected_paste_destination(&[folder,plain]).is_none());Ok(())
     }
     #[test]fn selection_uses_canonical_identity_when_shell_metadata_changes()->Result<()>{
