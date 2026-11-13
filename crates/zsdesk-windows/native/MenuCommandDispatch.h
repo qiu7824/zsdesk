@@ -5,14 +5,17 @@
 #include <cstdint>
 #include <cwchar>
 #include <vector>
+#include <string>
 
 namespace menu_dispatch {
-enum Kind : uint32_t { Dismissed=0, Application=1, Rename=2, Open=3, Explore=4, Invoked=5, Expanded=6, NativeHandled=7 };
-enum Intercept : uint32_t { InterceptRename=1, InterceptOpen=2 };
+enum Kind : uint32_t { Dismissed=0, Application=1, Rename=2, Open=3, Explore=4, Invoked=5, Expanded=6, NativeHandled=7,
+    Copy=8,Cut=9,Paste=10,Delete=11,DeletePermanent=12 };
+enum Intercept : uint32_t { InterceptRename=1, InterceptOpen=2,InterceptFileActions=4 };
 enum Phase : uint32_t { BeforePresentation=0, Presented=1, Executing=2 };
 struct Result { uint32_t kind=Dismissed,command=0;HRESULT status=S_OK;uint32_t phase=BeforePresentation; };
 static_assert(sizeof(Result)==16,"Menu result ABI");
 using BeforeInvoke=HRESULT(WINAPI*)(void*);
+inline thread_local std::wstring workingDirectory;
 
 inline HRESULT NumericOffset(UINT command,UINT first,UINT* offset) noexcept {
     if(!offset)return E_POINTER;
@@ -27,6 +30,7 @@ inline HRESULT InvokeNumeric(IContextMenu* menu,HWND owner,UINT command,UINT fir
     if(shift)info.fMask|=CMIC_MASK_SHIFT_DOWN;
     if(control)info.fMask|=CMIC_MASK_CONTROL_DOWN;
     info.hwnd=owner;info.lpVerb=MAKEINTRESOURCEA(offset);info.lpVerbW=MAKEINTRESOURCEW(offset);
+    info.lpDirectoryW=workingDirectory.empty()?nullptr:workingDirectory.c_str();
     info.nShow=SW_SHOWNORMAL;info.ptInvoke=point;
     return menu->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&info));
 }
@@ -49,6 +53,12 @@ inline Result Dispatch(IContextMenu* menu,HWND owner,UINT command,UINT first,POI
         if(intercept&InterceptOpen){
             if(!_wcsicmp(verb,L"open")){result.kind=Open;return result;}
             if(!_wcsicmp(verb,L"explore")){result.kind=Explore;return result;}
+        }
+        if(intercept&InterceptFileActions){
+            if(!_wcsicmp(verb,L"copy")||!_wcsicmp(verb,L"Windows.Copy")){result.kind=Copy;return result;}
+            if(!_wcsicmp(verb,L"cut")||!_wcsicmp(verb,L"Windows.Cut")){result.kind=Cut;return result;}
+            if(!_wcsicmp(verb,L"paste")||!_wcsicmp(verb,L"Windows.Paste")){result.kind=Paste;return result;}
+            if(!_wcsicmp(verb,L"delete")||!_wcsicmp(verb,L"Windows.Delete")){result.kind=shift?DeletePermanent:Delete;return result;}
         }
     }
     result.phase=Executing;

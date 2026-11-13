@@ -273,8 +273,8 @@ impl WindowState {
 
     unsafe fn search_scope_menu(&mut self) {
         let controls = self.search_controls();
-        let current = self.current_location().as_path().map(PathBuf::from)
-            .or_else(|| self.search_scope.as_ref().and_then(ShellLocation::as_path).map(PathBuf::from));
+        let current = super::integrated_search::font_scope::folder_scope(self.current_location())
+            .or_else(||self.search_scope.as_ref().and_then(super::integrated_search::font_scope::folder_scope));
         let spec = menus::menu(vec![
             menus::entry("全部磁盘", "all", true, controls.scope.is_none()),
             menus::entry("当前文件夹", "current", current.is_some(), current.is_some() && controls.scope == current),

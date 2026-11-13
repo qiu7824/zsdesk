@@ -252,12 +252,16 @@ pub enum ContextMenuMode {
     #[default]
     #[serde(rename = "windows11")]
     Windows11,
+    #[serde(rename = "drawn-windows11")]
+    DrawnWindows11,
 }
 
 /// Menu visibility does not disable commands or keyboard shortcuts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextMenuPreferences {
+    pub hidden_commands:Vec<String>,
+    pub shown_commands:Vec<String>,
     pub mode: ContextMenuMode,
     pub show_cut_copy_paste: bool,
     pub show_copy_path: bool,
@@ -272,9 +276,9 @@ pub struct ContextMenuPreferences {
 
 impl Default for ContextMenuPreferences {
     fn default() -> Self {
-        Self { mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
+        Self { hidden_commands:Vec::new(),shown_commands:Vec::new(),mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
             show_rename: true, show_delete: true, show_properties: true, show_share: true,
-            show_new: true, show_seven_zip: true, show_wps: false }
+            show_new: true, show_seven_zip: true, show_wps: true }
     }
 }
 
@@ -322,20 +326,27 @@ impl Default for QuickSearchPreferences {
 #[serde(default)]
 pub struct ExplorerUi {
     pub startup_location: StartupLocation,
+    pub new_tab_location: NewTabLocation,
     pub tab_placement: TabPlacement,
+    /// Side tab width in DIP; independent of the current monitor scale.
+    pub side_tabs_width: i32,
+    pub side_tabs_compact: bool,
     pub dual_pane: bool,
     /// Split position in thousandths, independent of monitor scaling.
     pub pane_ratio: u16,
     pub double_click_close_tab: bool,
+    pub double_click_blank_up: bool,
     pub close_window_on_last_tab: bool,
     pub show_tab_count: bool,
+    pub show_tab_list: bool,
     pub mouse_gestures: bool,
-    /// Uses indexed metadata only; never starts a directory-size scan.
+    /// Show view-local totals; native calculation is available without an index.
     pub everything_folder_sizes: bool,
     pub show_tree: bool,
     /// Navigation tree width in DIP.
     pub tree_width: i32,
     pub show_bookmarks: bool,
+    pub bookmarks_on_right: bool,
     pub show_preview: bool,
     pub show_details: bool,
     pub command_bar: CommandBarPreferences,
@@ -368,6 +379,7 @@ pub struct SearchPreferences {
     pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
 }
 impl ExplorerUi{
+    pub fn tab_count_button_visible(&self)->bool{self.show_tab_count&&self.show_tab_list}
     pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,include_development:self.search_include_development,
         index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
         everything_executable:self.everything_executable.clone(),folder_sizes:self.everything_folder_sizes}}
@@ -378,10 +390,10 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { startup_location:StartupLocation::default(), tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
+        Self { startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,show_tab_count:true,
-            show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
+            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,
+            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
@@ -400,6 +412,14 @@ pub enum StartupLocation {
     RestoreSession,
     ThisPc,
     Folder(PathBuf),
+}
+
+#[derive(Clone,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+pub enum NewTabLocation{#[default]ThisPc,CurrentFolder,Folder(PathBuf)}
+impl NewTabLocation{
+    pub fn target(&self,current:&ShellLocation)->ShellLocation{match self{
+        Self::ThisPc=>ShellLocation::ThisPc,Self::CurrentFolder=>current.clone(),Self::Folder(path)=>ShellLocation::Path(path.clone())
+    }}
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -448,6 +468,9 @@ impl ExplorerSession {
 
     pub fn normalize(&mut self) {
         if self.ui.search_backend.is_builtin(){self.ui.search_backend=SearchBackendPreference::NativeNtfs;}
+        for keys in [&mut self.ui.context_menu.hidden_commands,&mut self.ui.context_menu.shown_commands]{
+            keys.retain(|key|!key.is_empty()&&key.len()<=512&&!key.contains('\0'));keys.sort();keys.dedup();keys.truncate(1000);
+        }
         self.ui.search_idle_seconds=self.ui.search_idle_seconds.clamp(30,3600);
         if self.tabs.is_empty() {
             let id = self.take_id();
@@ -461,6 +484,7 @@ impl ExplorerSession {
         self.ui.pane_ratio = self.ui.pane_ratio.clamp(200, 800);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
+        self.ui.side_tabs_width=self.ui.side_tabs_width.clamp(120,420);
         let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
@@ -800,5 +824,14 @@ mod tests {
         let path=PathBuf::from(r"E:\自定义 空格");session.ui.startup_location=StartupLocation::Folder(path.clone());session.apply_startup_location();
         assert_eq!(session.active_tab().current(),&ShellLocation::Path(path));
         let restored:ExplorerSession=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();assert_eq!(restored,session);
+    }
+    #[test]fn new_tab_targets_are_independent_of_startup_restore(){
+        let current=ShellLocation::Path(r"E:\当前 目录".into());
+        assert_eq!(NewTabLocation::default().target(&current),ShellLocation::ThisPc);
+        assert_eq!(NewTabLocation::CurrentFolder.target(&current),current);
+        let location=NewTabLocation::Folder(r"E:\固定目录".into());
+        assert_eq!(location.target(&current),ShellLocation::Path(r"E:\固定目录".into()));
+        let ui:ExplorerUi=serde_json::from_str("{}").unwrap();
+        assert_eq!(ui.new_tab_location,NewTabLocation::ThisPc);assert!(ui.double_click_blank_up);
     }
 }

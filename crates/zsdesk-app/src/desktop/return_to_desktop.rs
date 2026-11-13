@@ -4,7 +4,7 @@ use std::{cell::RefCell, path::{Path, PathBuf}, rc::Rc, sync::{Arc, Mutex, atomi
 use windows::{core::{implement, Error, HRESULT, Interface, PCWSTR, Ref, Result}, Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::{Com::{CoCreateInstance, CoTaskMemFree, IDataObject, CLSCTX_INPROC_SERVER},
-        Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_MOVE, DROPEFFECT_NONE}},
+        Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE}},
     UI::{Shell::{FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
         IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOFX_ADDUNDORECORD},
         WindowsAndMessaging::*},
@@ -30,6 +30,9 @@ fn already_on_desktop(entry: &ShellEntry, user: &Path, public: Option<&Path>) ->
 struct ProgressState { completed: Vec<String>, failed: Option<HRESULT> }
 #[implement(IFileOperationProgressSink)]
 struct Progress { state: Arc<Mutex<ProgressState>>, cancel_before: bool }
+impl Progress { fn record_completed(&self, created: Ref<IShellItem>) {
+        if let Some(item)=created.as_ref(){if let Ok(value)=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)}{let path=unsafe{value.to_string()};unsafe{CoTaskMemFree(Some(value.0.cast()))};if let Ok(path)=path{self.state.lock().unwrap_or_else(|e|e.into_inner()).completed.push(path);}}}
+    }}
 #[allow(non_snake_case)]
 impl IFileOperationProgressSink_Impl for Progress_Impl {
     fn StartOperations(&self)->Result<()> { Ok(()) }
@@ -44,17 +47,12 @@ impl IFileOperationProgressSink_Impl for Progress_Impl {
         // Only completed move statuses with an actual destination object count;
         // skipped, pending, collision prompts and cancellation never invent names.
         if completed_move(result) {
-            if let Some(item)=created.as_ref() {
-                if let Ok(value)=unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) } {
-                    let path=unsafe { value.to_string() }; unsafe { CoTaskMemFree(Some(value.0.cast())) };
-                    if let Ok(path)=path { self.state.lock().unwrap_or_else(|e|e.into_inner()).completed.push(path); }
-                }
-            }
+            self.record_completed(created);
         } else if result.is_err() { self.state.lock().unwrap_or_else(|e|e.into_inner()).failed=Some(result); }
         Ok(())
     }
     fn PreCopyItem(&self,_:u32,_:Ref<IShellItem>,_:Ref<IShellItem>,_:&PCWSTR)->Result<()> { Ok(()) }
-    fn PostCopyItem(&self,_:u32,_:Ref<IShellItem>,_:Ref<IShellItem>,_:&PCWSTR,_:HRESULT,_:Ref<IShellItem>)->Result<()> { Ok(()) }
+    fn PostCopyItem(&self,_:u32,_:Ref<IShellItem>,_:Ref<IShellItem>,_:&PCWSTR,result:HRESULT,created:Ref<IShellItem>)->Result<()> { if completed_move(result){self.record_completed(created);}else if result.is_err(){self.state.lock().unwrap_or_else(|e|e.into_inner()).failed=Some(result);} Ok(()) }
     fn PreDeleteItem(&self,_:u32,_:Ref<IShellItem>)->Result<()> { Ok(()) }
     fn PostDeleteItem(&self,_:u32,_:Ref<IShellItem>,_:HRESULT,_:Ref<IShellItem>)->Result<()> { Ok(()) }
     fn PreNewItem(&self,_:u32,_:Ref<IShellItem>,_:&PCWSTR)->Result<()> { Ok(()) }
@@ -63,10 +61,10 @@ impl IFileOperationProgressSink_Impl for Progress_Impl {
     fn ResetTimer(&self)->Result<()> { Ok(()) } fn PauseTimer(&self)->Result<()> { Ok(()) } fn ResumeTimer(&self)->Result<()> { Ok(()) }
 }
 
-fn move_files(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, progress: Arc<Mutex<ProgressState>>) -> Result<()> {
-    move_files_inner(owner,paths,destination,progress,false,false)
+fn move_files(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, progress: Arc<Mutex<ProgressState>>,copy:bool) -> Result<()> {
+    move_files_inner(owner,paths,destination,progress,false,false,copy)
 }
-fn move_files_inner(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, progress: Arc<Mutex<ProgressState>>, quiet:bool, cancel_before:bool) -> Result<()> {
+fn move_files_inner(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, progress: Arc<Mutex<ProgressState>>, quiet:bool, cancel_before:bool,copy:bool) -> Result<()> {
     unsafe { OleInitialize(None)?; }
     struct Apartment; impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize(); } } }
     let _apartment=Apartment;
@@ -80,7 +78,7 @@ fn move_files_inner(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, pro
         if IsWindow(Some(HWND(owner as *mut _))).as_bool() { operation.SetOwnerWindow(HWND(owner as *mut _))?; }
         for path in paths {
             let item:IShellItem=SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()),None)?;
-            operation.MoveItem(&item,&target,PCWSTR::null(),&sink)?;
+            if copy {operation.CopyItem(&item,&target,PCWSTR::null(),&sink)?;} else {operation.MoveItem(&item,&target,PCWSTR::null(),&sink)?;}
         }
         operation.PerformOperations()?;
         if operation.GetAnyOperationsAborted()?.as_bool() {
@@ -92,28 +90,17 @@ fn move_files_inner(owner: isize, paths: Vec<PathBuf>, destination: PathBuf, pro
 
 /// The worker owns all filesystem/COM work. The caller pumps the desktop STA
 /// while the native progress dialog is active, outside every HOST borrow.
-fn transfer(owner:HWND,paths:Vec<PathBuf>,target:PathBuf)->(Vec<String>,Option<Error>) {
-    let progress=Arc::new(Mutex::new(ProgressState::default()));
-    let work=progress.clone(); let owner=owner.0 as isize;
-    let worker=std::thread::Builder::new().name("zsdesk-return-desktop".into()).spawn(move||move_files(owner,paths,target,work));
-    let Ok(worker)=worker else { return (Vec::new(),Some(error("无法启动桌面文件移动"))); };
-    let mut quit=None;
-    while !worker.is_finished() {
-        let mut message=MSG::default();
-        for _ in 0..64 {
-            if !unsafe { PeekMessageW(&mut message,None,0,0,PM_REMOVE) }.as_bool() { break; }
-            if message.message==WM_QUIT { quit=Some(message.wParam.0 as i32); continue; }
-            unsafe { let _=TranslateMessage(&message); DispatchMessageW(&message); }
-        }
-        std::thread::sleep(Duration::from_millis(10));
+fn transfer(owner:HWND,paths:Vec<PathBuf>,target:PathBuf,copy:bool)->(Vec<String>,Option<Error>) {
+    match zsdesk_windows::shell::file_transfer::transfer_drop(owner,paths,target,!copy){
+        Ok(done)=>{
+            let outputs=done.outputs.iter().map(|path|path.to_string_lossy().into_owned()).collect();
+            let failure=done.error.map(Error::from_hresult).or_else(||done.aborted.then(||Error::from_hresult(HRESULT(0x800704c7u32 as i32))));
+            (outputs,failure)
+        },Err(error)=>(Vec::new(),Some(error)),
     }
-    let result=worker.join().unwrap_or_else(|_|Err(error("桌面文件移动未能正常结束")));
-    if let Some(code)=quit { unsafe { PostQuitMessage(code) }; }
-    let mut state=progress.lock().unwrap_or_else(|e|e.into_inner());
-    (std::mem::take(&mut state.completed),result.err().or_else(||state.failed.map(Error::from_hresult)))
 }
 
-pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT)->bool {
+pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT,moving:bool)->bool {
     if entries.is_empty() || entries.len()>10_000 || ACTIVE.swap(true,Ordering::AcqRel) { return false; }
     struct Active; impl Drop for Active { fn drop(&mut self) { ACTIVE.store(false,Ordering::Release); } }
     let _active=Active;
@@ -121,13 +108,13 @@ pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT)->bool
     let public=desktop::public_desktop();
     let mut keys=Vec::new(); let mut paths=Vec::new();let mut unique=std::collections::HashSet::new();
     for entry in entries {
-        if !unique.insert(entry.key.to_lowercase()){continue;}
-        if already_on_desktop(entry,&target,public.as_deref()) { keys.push(entry.key.clone()); }
+        if !unique.insert(entry.key.clone()){continue;}
+        if moving&&already_on_desktop(entry,&target,public.as_deref()) { keys.push(entry.key.clone()); }
         else if let Some(path)=&entry.path { paths.push(path.clone()); }
     }
     let requested=unique.len();
     let mut failure=None;
-    if !paths.is_empty() { let (moved,error)=transfer(owner,paths,target); keys.extend(moved); failure=error; }
+    if !paths.is_empty() { let (moved,error)=transfer(owner,paths,target,!moving); keys.extend(moved); failure=error; }
     let published=if keys.is_empty(){0}else{
         match with_host(|host|host.release_desktop_keys(&keys,point)) {
             Some(Ok(count))=>count,
@@ -146,7 +133,7 @@ pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT)->bool
 pub(super) fn return_selection(fence:u64,point:POINT) {
     let Some((owner,entries))=with_host(|host|host.win_index(fence).map(|_|
         (host.hwnd,host.selected_entries_owned(fence)))).flatten() else { return; };
-    return_entries(owner,&entries,point);
+    return_entries(owner,&entries,point,true);
     super::refresh_fence(fence);
 }
 
@@ -160,10 +147,9 @@ struct ReturnDrop { owner:HWND, source:u64, expected:IDataObject, entries:Vec<Sh
 type CellState=std::cell::Cell<bool>;
 impl ReturnDrop {
     fn effect(&self,keys:u32,allowed:DROPEFFECT)->DROPEFFECT {
-        // Ctrl/Alt explicitly request copy/link, so let those drops be rejected
-        // here rather than silently moving the user's files.
-        if !self.active.get() || keys & (8|32)!=0 || allowed.0&DROPEFFECT_MOVE.0==0 { return DROPEFFECT_NONE; }
-        if with_host(|host|host.internal_drag.as_ref().is_some_and(|(source,_)|*source==self.source)).unwrap_or(false) { DROPEFFECT_MOVE } else { DROPEFFECT_NONE }
+        if !self.active.get()||keys&32!=0||with_host(|host|!host.internal_drag.as_ref().is_some_and(|(source,_)|*source==self.source)).unwrap_or(true){return DROPEFFECT_NONE;}
+        if keys&8!=0{return if allowed.0&DROPEFFECT_COPY.0!=0&&self.entries.iter().all(|entry|entry.path.is_some()){DROPEFFECT_COPY}else{DROPEFFECT_NONE};}
+        if allowed.0&DROPEFFECT_MOVE.0!=0{DROPEFFECT_MOVE}else if allowed.0&DROPEFFECT_COPY.0!=0{DROPEFFECT_COPY}else{DROPEFFECT_NONE}
     }
 }
 impl DropHandler for ReturnDrop {
@@ -172,9 +158,13 @@ impl DropHandler for ReturnDrop {
     fn leave(&self) { self.active.set(false); }
     fn dropped(&self,data:&IDataObject,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT {
         if data!=&self.expected || self.effect(keys,allowed)==DROPEFFECT_NONE { return DROPEFFECT_NONE; }
-        let complete=return_entries(self.owner,&self.entries,point);
+        let requested=self.effect(keys,allowed);
+        let complete=return_entries(self.owner,&self.entries,point,requested==DROPEFFECT_MOVE);
         *self.completed.borrow_mut()=complete;
-        if complete { DROPEFFECT_MOVE } else { DROPEFFECT_NONE }
+        let (effect,performed,logical)=super::drop_effects(requested==DROPEFFECT_MOVE,complete);
+        let _=super::publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_PERFORMEDDROPEFFECT,performed);
+        let _=super::publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_LOGICALPERFORMEDDROPEFFECT,logical);
+        effect
     }
 }
 unsafe extern "system" fn surface_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
@@ -233,12 +223,12 @@ impl DesktopDropSurfaces {
             fs::OpenOptions::new().write(true).create_new(true).open(path)?.write_all(bytes)?;
         }
         let progress=Arc::new(Mutex::new(ProgressState::default()));
-        move_files_inner(0,vec![first.clone()],target.clone(),progress.clone(),true,false)?;
+        move_files_inner(0,vec![first.clone()],target.clone(),progress.clone(),true,false,false)?;
         let actual=progress.lock().unwrap().completed.clone();ensure!(actual.len()==1,"missing actual completed destination");
         ensure!(same_path(Path::new(&actual[0]),&target.join("移回 桌面.txt")),"wrong completion target");
         ensure!(!first.try_exists()?&&fs::read(&actual[0])?==b"first-content","move lost contents");
         let cancelled_progress=Arc::new(Mutex::new(ProgressState::default()));
-        let _=move_files_inner(0,vec![cancelled.clone()],target.clone(),cancelled_progress.clone(),true,true);
+        let _=move_files_inner(0,vec![cancelled.clone()],target.clone(),cancelled_progress.clone(),true,true,false);
         ensure!(cancelled_progress.lock().unwrap().completed.is_empty(),"cancel reported completion");
         ensure!(fs::read(&cancelled)?==b"cancel-preserves-content"&&!target.join("保留.txt").try_exists()?,"cancel changed source");
         ensure!(fs::read(&untouched)?==b"unrelated","unrelated file changed");

@@ -2,10 +2,16 @@
 
 pub mod commands;
 pub mod file_transfer;
+pub mod folder_totals;
 mod events;
 mod explorer_browser;
 pub mod icons;
 pub mod menu;
+mod packaged_commands;
+mod packaged_overlay;
+mod packaged_state_worker;
+pub use packaged_state_worker::maybe_handle_packaged_state_worker;
+pub use packaged_state_worker::{packaged_state_worker_test_entry,run_packaged_state_test_worker,pending_packaged_state_workers,packaged_state_cleanup_errors};
 pub mod new_menu;
 mod namespace_tree;
 pub mod notify;

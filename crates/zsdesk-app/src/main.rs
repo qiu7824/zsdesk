@@ -17,11 +17,14 @@ mod context_preferences;
 mod flyout_menu;
 mod routing_control;
 mod fast_search;
+mod folder_size_data;
 mod quick_search;
 mod win_e_bridge;
 mod explorer_forwarder;
 mod runtime;
 mod context_menu_process;
+mod utility_panel;
+mod update_check;
 
 /// Lets the installer wait for all application windows and desktop guards to
 /// finish before replacing or uninstalling their files.
@@ -39,6 +42,9 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    if let Some(result)=zsdesk_windows::shell::maybe_handle_packaged_state_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
+        if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;
+    }
     if let Some(result)=explorer_forwarder::run_guard_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=context_menu_process::run_worker_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=window::preview_process::run_if_requested(){

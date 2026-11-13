@@ -544,17 +544,23 @@ impl ExplorerBrowserHost {
     /// before its parent window or COM apartment is destroyed.
     pub unsafe fn destroy(&self) {
         if self.destroyed.replace(true) { return; }
+        let trace=|stage:&str|if std::env::var_os("ZSDESK_RUNTIME_TRACE").is_some(){eprintln!("Shell host {} teardown: {stage}",self.source);};
         // Block reentrant service queries while this particular browser is
         // being torn down; another/new browser may still enable its own mode.
         self.modern.set(false);
+        trace("menu");
         #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
         unsafe { zs_menu_shutdown(); }
         let _keep_callbacks_alive = (&self.events, &self.site);
+        trace("Unadvise");
         let _ = unsafe { self.browser.Unadvise(self.advise_cookie) };
+        trace("SetSite");
         if let Ok(object_with_site) = self.browser.cast::<IObjectWithSite>() {
             let _ = unsafe { object_with_site.SetSite(None::<&IUnknown>) };
         }
+        trace("Destroy");
         let _ = unsafe { self.browser.Destroy() };
+        trace("complete");
     }
 }
 
@@ -706,10 +712,8 @@ impl IServiceProvider_Impl for BrowserSite_Impl {
         }
         unsafe { *ppvobject = std::ptr::null_mut(); }
         if unsafe { *guidservice } != ICommDlgBrowser::IID && unsafe { *guidservice } != IExplorerPaneVisibility::IID {
-            #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
-            if let Some(browser) = self.browser.upgrade().filter(|_|self.modern.get() && !super::menu::view_menu_is_delegated()) {
-                return unsafe { zs_menu_query(browser.as_raw(), guidservice, riid, ppvobject) }.ok();
-            }
+            // Context-menu rendering is owned by the public menu adapter.
+            // Do not instantiate a version-specific private Shell presenter.
             return Err(Error::from_hresult(E_NOINTERFACE));
         }
         let result = unsafe { self.QueryInterface(riid, ppvobject) };

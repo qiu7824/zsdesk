@@ -4,7 +4,7 @@
 use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, time::{Duration, Instant}};
 
 use windows::{
-    core::{BOOL, PCWSTR},
+    core::{BOOL, PCWSTR,Interface,IUnknown},
     Win32::{
         Foundation::{HWND, LPARAM, POINT, POINTL, RECT, WPARAM},
         Graphics::{Direct2D::ID2D1Bitmap, Gdi::{EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, HDC, HMONITOR, MONITORINFO,
@@ -25,6 +25,7 @@ use zsdesk_windows::{desktop::{self, ShellEntry}, gfx::{Gfx, TextStyle}, shell::
 
 use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, SelectionChange, TabMeta};
 #[cfg(test)]#[path="layer_regression.rs"]mod layer_regression;
+#[cfg(test)]#[path="lifecycle_regression.rs"]mod lifecycle_regression;
 
 /// Hovering a dragged file over another tab switches to it after this delay.
 const TAB_HOVER_SWITCH: Duration = Duration::from_millis(600);
@@ -39,31 +40,33 @@ fn zoom_icon_size(current: IconSize, steps: i32) -> IconSize {
     let index = match current { IconSize::Small => 0i32, IconSize::Medium => 1, IconSize::Large => 2 };
     match (index + steps).clamp(0, 2) { 0 => IconSize::Small, 2 => IconSize::Large, _ => IconSize::Medium }
 }
-fn desktop_item_position(origin:Bounds,width:i32,height:i32,occupied:&[Bounds])->Bounds {
+fn desktop_item_position(origin:Bounds,width:i32,height:i32,occupied:&[Bounds])->Option<Bounds> {
+    if origin.w<=0||origin.h<=0||origin.w>width||origin.h>height{return None;}
     let candidate=Bounds::new(origin.x.clamp(0,(width-origin.w).max(0)),origin.y.clamp(0,(height-origin.h).max(0)),origin.w,origin.h);
     let free=|cell:Bounds|occupied.iter().all(|other|cell.right()<=other.x||cell.x>=other.right()||cell.bottom()<=other.y||cell.y>=other.bottom());
-    if free(candidate) { return candidate; }
-    for x in (0..=(width-origin.w).max(0)).step_by(origin.w.max(1) as usize) {
-        for y in (0..=(height-origin.h).max(0)).step_by(origin.h.max(1) as usize) {
-            let cell=Bounds::new(x,y,origin.w,origin.h); if free(cell) { return cell; }
+    if free(candidate) { return Some(candidate); }
+    for x in (candidate.x.rem_euclid(origin.w)..=(width-origin.w).max(0)).step_by(origin.w as usize) {
+        for y in (candidate.y.rem_euclid(origin.h)..=(height-origin.h).max(0)).step_by(origin.h as usize) {
+            let cell=Bounds::new(x,y,origin.w,origin.h); if free(cell) { return Some(cell); }
         }
     }
-    candidate
+    None
 }
 
-pub const WM_TRAY: u32 = WM_APP + 10;
-pub const WM_DESKTOP_CHANGED: u32 = WM_APP + 11;
-pub const WM_FOLDER_CHANGED: u32 = WM_APP + 12;
-pub const WM_ICON_READY: u32 = WM_APP + 13;
-pub const WM_DESKTOP_DBLCLICK: u32 = WM_APP + 14;
-pub const WM_RENAME_DONE: u32 = WM_APP + 15;
-pub const TIMER_SAVE: usize = 1;
-pub const TIMER_DESKTOP: usize = 2;
-pub const TIMER_FOLDER: usize = 3;
-pub const TIMER_PEEK: usize = 4;
-pub const TIMER_ICONS: usize = 5;
-/// Fence timer (6 is the interaction-cancel retry in `desktop::fence_proc`).
-pub const TIMER_AUTOSCROLL: usize = 7;
+pub const WM_TRAY: u32 = super::protocol::Message::Tray as u32;
+pub const WM_DESKTOP_CHANGED: u32 = super::protocol::Message::DesktopChanged as u32;
+pub const WM_FOLDER_CHANGED: u32 = super::protocol::Message::FolderChanged as u32;
+pub const WM_ICON_READY: u32 = super::protocol::Message::IconReady as u32;
+pub const WM_DESKTOP_DBLCLICK: u32 = super::protocol::Message::DesktopDoubleClick as u32;
+pub const WM_RENAME_DONE: u32 = super::protocol::Message::RenameDone as u32;
+pub const TIMER_SAVE: usize = super::protocol::HostTimer::Save as usize;
+pub const TIMER_DESKTOP: usize = super::protocol::HostTimer::Desktop as usize;
+pub const TIMER_FOLDER: usize = super::protocol::FenceTimer::Folder as usize;
+pub const TIMER_PEEK: usize = super::protocol::FenceTimer::Peek as usize;
+pub const TIMER_ICONS: usize = super::protocol::HostTimer::Icons as usize;
+pub const TIMER_AUTOSCROLL: usize = super::protocol::FenceTimer::Autoscroll as usize;
+pub const TIMER_NOTICE:usize=super::protocol::FenceTimer::Notice as usize;
+pub const TIMER_SELECTION:usize=super::protocol::FenceTimer::Selection as usize;
 pub const FENCE_CLASS: &str = "ZSDesk.Native.Fence";
 pub(super) const TRAY_ID:u32=1;
 
@@ -94,6 +97,25 @@ pub enum After {
 
 /// Where a drag over a fence would drop.
 struct DropSpot { hover: usize, tab: Option<usize>, into: u64, target: Option<IDropTarget>, own: bool }
+pub(super) enum PreparedDrop{Shell(IDropTarget),FileSystem{owner:HWND,fence:u64,paths:Vec<PathBuf>,destination:PathBuf,moving:bool},Assigned,Rejected}
+fn matching_output_indices(entries:&[ShellEntry],paths:&[PathBuf])->Vec<usize>{
+    let mut indices=Vec::new();let mut seen=HashSet::new();
+    for path in paths{
+        let exact=entries.iter().position(|entry|entry.path.as_ref()==Some(path));
+        let index=exact.or_else(||{
+            let mut aliases=entries.iter().enumerate().filter(|(_,entry)|entry.path.as_ref().is_some_and(|entry|crate::explorer_forwarder::same_path(entry,path)));
+            let first=aliases.next().map(|(index,_)|index);if aliases.next().is_none(){first}else{None}
+        });
+        if let Some(index)=index{if seen.insert(index){indices.push(index);}}
+    }indices
+}
+fn ordinary_drop_folder(path:&Path)->bool{
+    use windows::Win32::System::SystemServices::{SFGAO_FILESYSTEM,SFGAO_FOLDER,SFGAO_STREAM};
+    pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.into()))
+        .and_then(|value|pidl::item_from_pidl(&value).ok()).is_some_and(|item|
+            unsafe{item.GetAttributes(SFGAO_FILESYSTEM|SFGAO_FOLDER|SFGAO_STREAM)}.is_ok_and(|value|
+                value.0&(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)==(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)&&value.0&SFGAO_STREAM.0==0))
+}
 
 fn history_shortcut(key: u16, control: bool, shift: bool, alt: bool) -> Option<HistoryAction> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_Y, VK_Z};
@@ -149,13 +171,25 @@ pub struct Monitor { pub name: String, pub work: RECT, pub dpi: u32, pub primary
 #[derive(Clone, Copy)]
 struct DesktopAnchor { hwnd: HWND, process: u32, thread: u32 }
 impl DesktopAnchor {
+    fn current() -> Option<Self> {
+        let view = desktop::desktop_defview()?;
+        Self::capture(unsafe { GetAncestor(view, GA_ROOT) })
+    }
     fn capture(hwnd: HWND) -> Option<Self> {
         if !unsafe { IsWindow(Some(hwnd)) }.as_bool()
             || !unsafe { IsWindowVisible(hwnd) }.as_bool()
+            || is_cloaked(hwnd)
             || !matches!(super::class_name(hwnd).as_str(), "WorkerW" | "Progman") { return None; }
+        // WorkerW is also used by Shell helpers inside ordinary applications.
+        // Only the window currently hosting the desktop view is an anchor;
+        // its rectangle alone does not establish that it covers applications.
+        let view = desktop::desktop_defview()?;
+        if unsafe { GetAncestor(view, GA_ROOT) } != hwnd { return None; }
         let mut process = 0;
         let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
-        (process != 0 && thread != 0).then_some(Self { hwnd, process, thread })
+        let mut view_process = 0;
+        unsafe { GetWindowThreadProcessId(view, Some(&mut view_process)); }
+        (process != 0 && thread != 0 && process == view_process).then_some(Self { hwnd, process, thread })
     }
     fn valid(self) -> bool {
         Self::capture(self.hwnd).is_some_and(|current| current.process == self.process && current.thread == self.thread)
@@ -197,7 +231,9 @@ pub struct DesktopHost {
     pub explorer_config: PathBuf,
     pub config: DesktopConfig,
     pub fences: Vec<FenceWin>,
+    cut_paths: HashSet<String>,
     desktop_entries: Vec<ShellEntry>,
+    #[cfg(test)] desktop_test_entries:Option<Vec<ShellEntry>>,
     pub gfx: Gfx,
     icons: HashMap<IconKey, IconSlot>,
     icon_clock: u64,
@@ -212,13 +248,19 @@ pub struct DesktopHost {
     /// File names dropped/created for a desktop fence, assigned once they appear.
     pending: Vec<(String, u64, Instant)>,
     known: HashSet<String>,
+    desktop_snapshot_initialized:bool,
     pub taskbar_created: u32,
     palette: FencePalette,
     /// Active Shell drop target while dragging over a fence: (fence, item or MAX, target).
     drop_delegate: Option<(u64, usize, IDropTarget)>,
     drop_data: Option<IDataObject>,
     pub internal_drag: Option<(u64, Vec<String>)>,
+    internal_drag_data:Option<IDataObject>,drag_is_internal:bool,
+    drag_geometry:Vec<(String,Bounds)>,
     pub(super) menu_input_started: Option<(u64,Instant)>,
+    modal_holds:HashMap<u64,u32>,
+    pending_menu:Option<(u64,u64)>,
+    incoming_drag:Option<u64>,
     tray: bool,
     pub(super) tray_version4:bool,
     /// Fence whose title bar receives the fence being moved (merge as a tab).
@@ -231,10 +273,11 @@ impl DesktopHost {
     pub fn new(hwnd: HWND, config_path: PathBuf, explorer_config: PathBuf, config: DesktopConfig, gfx: Gfx) -> Self {
         let loader = IconLoader::spawn(hwnd, WM_ICON_READY);
         let taskbar_created = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
-        let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), gfx,
-            icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
-            loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(), menu_input_started:None,
-            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None, tray: false,tray_version4:false,
+        let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), #[cfg(test)]desktop_test_entries:None,gfx,
+            cut_paths:HashSet::new(),icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
+            loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),desktop_snapshot_initialized:false, menu_input_started:None,
+            modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),
+            taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None,internal_drag_data:None,drag_is_internal:false, tray: false,tray_version4:false,
             merge_target: None, tab_hover: None };
         host.update_palette();
         super::fence::set_blur(host.config.settings.blur);
@@ -414,6 +457,7 @@ impl DesktopHost {
             return;
         }
         self.config.settings.organize = true;
+        super::update_hook(self.config.settings.double_click_toggle,true);
         let has_desktop = self.config.fences.iter().any(|f| f.is_desktop());
         if !has_desktop {
             if !self.config.stash.is_empty() {
@@ -423,9 +467,6 @@ impl DesktopHost {
                 self.refresh_desktop_entries();
                 self.create_default_fences();
             }
-        }
-        if !self.config.fences.iter().any(|f| f.is_desktop() && f.catch_all) {
-            if let Some(f) = self.config.fences.iter_mut().find(|f| f.is_desktop()) { f.catch_all = true; }
         }
         self.config.settings.hidden = false;
         self.save_now();
@@ -458,6 +499,7 @@ impl DesktopHost {
             self.notify_error("系统桌面图标尚未恢复，已保留桌面格子和恢复进程，请稍后重试。");return;
         }
         self.config.settings.organize = false;
+        super::update_hook(self.config.settings.double_click_toggle,false);
         self.config.settings.icons_hidden_by_zsdesk = false;
         let (desktop_fences, rest): (Vec<Fence>, Vec<Fence>) = std::mem::take(&mut self.config.fences).into_iter().partition(|f| f.is_desktop());
         self.config.fences = rest;
@@ -523,10 +565,6 @@ impl DesktopHost {
     pub fn delete_fence(&mut self, id: u64) {
         self.config.release_tab(id);
         self.config.fences.retain(|f| f.id != id);
-        if self.config.settings.organize && !self.config.fences.iter().any(|f| f.is_desktop() && f.catch_all) {
-            if let Some(f) = self.config.fences.iter_mut().find(|f| f.is_desktop()) { f.catch_all = true; }
-            else { self.create_catch_all(); }
-        }
         self.save_now();
         self.sync_windows();
         self.refresh_desktop();
@@ -660,6 +698,7 @@ impl DesktopHost {
         let rect = self.fences[fi].window_rect();
         let (old, new) = (self.fences[fi].hwnd, self.fences[ti].hwnd);
         let peek = std::mem::replace(&mut self.fences[fi].peek, false);
+        self.fences[fi].pending_selection=None;let _=unsafe{KillTimer(Some(old),TIMER_SELECTION)};
         let blocked = self.fences[fi].peek_blocked;
         let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == old;
         self.fences[fi].hover = FenceHit::None;
@@ -856,18 +895,17 @@ impl DesktopHost {
     /// Places every fence directly above `desktop` (the raised "显示桌面" WorkerW
     /// or Progman), skipping topmost windows so fences never cover applications.
     pub fn raise_above(&mut self, desktop: HWND) {
-        self.desktop_exposed=true;
+        self.desktop_exposed=DesktopAnchor::capture(desktop).is_some();
         self.place_above_desktop(desktop);
     }
 
     fn place_above_desktop(&mut self, desktop: HWND) {
-        let Some(mut anchor) = DesktopAnchor::capture(desktop) else { return };
-        // Progman may receive activation while a previously raised WorkerW
-        // still covers it. Keep the higher verified desktop window as anchor,
-        // but only while it still hides the applications beneath it.
-        if let Some(previous) = self.desktop_anchor.filter(|value| value.valid()) {
-            if window_precedes(previous.hwnd, anchor.hwnd) && self.covers_applications_below(previous.hwnd) { anchor = previous; }
-        }
+        let Some(anchor) = DesktopAnchor::capture(desktop) else {
+            self.desktop_exposed=false;
+            self.desktop_anchor=DesktopAnchor::current();
+            self.place_below_applications(self.desktop_anchor);
+            return;
+        };
         self.desktop_anchor = Some(anchor);
         // A desktop-class window in the middle of the application band that
         // leaves applications beneath it visible (a leftover Show Desktop
@@ -889,7 +927,7 @@ impl DesktopHost {
 
     pub fn lower_all(&mut self, foreground: HWND) {
         let anchor=self.desktop_anchor.filter(|anchor|anchor.valid())
-            .or_else(||desktop::progman().and_then(DesktopAnchor::capture));
+            .or_else(DesktopAnchor::current);
         self.desktop_anchor=anchor;
         let class=super::class_name(foreground);
         let transient=foreground.0.is_null() || matches!(class.as_str(),"WorkerW"|"Progman"|"#32768")
@@ -912,7 +950,8 @@ impl DesktopHost {
             && !matches!(super::class_name(window).as_str(),"WorkerW"|"Progman")
             && unsafe{IsWindowVisible(window)}.as_bool() && !unsafe{IsIconic(window)}.as_bool() && !is_cloaked(window)
             && unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0==0
-            && unsafe{GetWindowRect(window,&mut rect)}.is_ok() && rect.right>rect.left && rect.bottom>rect.top).then_some(rect)
+            && unsafe{GetWindowRect(window,&mut rect)}.is_ok() && rect.right>rect.left && rect.bottom>rect.top
+            && intersect(rect,virtual_screen()).is_some()).then_some(rect)
     }
 
     /// Whether `desktop` hides every application window below it, so fences
@@ -950,7 +989,7 @@ impl DesktopHost {
     /// without a foreground event from another application.
     pub fn repair_layer(&mut self) {
         let anchor = self.desktop_anchor.filter(|value| value.valid())
-            .or_else(|| desktop::progman().and_then(DesktopAnchor::capture));
+            .or_else(DesktopAnchor::current);
         let foreground = unsafe { GetForegroundWindow() };
         let class = super::class_name(foreground);
         self.desktop_anchor=anchor;
@@ -960,6 +999,16 @@ impl DesktopHost {
             super::schedule_desktop_raise(self.hwnd);
         }
         self.lower_all(foreground);
+    }
+
+    /// Showing/restoring a normal application does not always emit a new
+    /// foreground event, especially across virtual desktops and Shell popups.
+    pub(super) fn reconcile_layer_event(&mut self,window:HWND){
+        if self.application_window(window).is_some(){
+            self.desktop_exposed=false;
+            let anchor=self.desktop_anchor.filter(|anchor|anchor.valid()).or_else(DesktopAnchor::current);
+            self.desktop_anchor=anchor;self.place_below_applications(anchor);
+        }else{self.repair_layer();}
     }
 
     pub fn place_all(&mut self) {
@@ -980,6 +1029,11 @@ impl DesktopHost {
         for id in ids { self.render(id); }
     }
 
+    pub(super) fn set_cut_paths(&mut self,paths:&[PathBuf]){
+        let paths=paths.iter().map(|path|super::clipboard::path_key(path)).collect();
+        if self.cut_paths!=paths{self.cut_paths=paths;self.render_all();}
+    }
+
     pub fn render(&mut self, id: u64) -> bool {
         if self.shutting_down { return false; }
         if self.config.settings.hidden && !self.config.is_released(id) { return true; }
@@ -988,6 +1042,8 @@ impl DesktopHost {
         if fence.is_hidden_tab() { self.fences[index].surface = None; return true; }
         let tabs = self.tab_metas(id, self.fences[index].dpi);
         let mut win = std::mem::replace(&mut self.fences[index], FenceWin::new(id));
+        win.cut_keys=win.entries.iter().filter(|entry|entry.path.as_ref().is_some_and(|path|self.cut_paths.contains(&super::clipboard::path_key(path))))
+            .map(|entry|entry.key.clone()).collect();
         win.tabs = tabs;
         let palette = self.palette;
         let show_counts = self.config.settings.show_counts;
@@ -1139,6 +1195,7 @@ impl DesktopHost {
     }
 
     fn refresh_desktop_entries(&mut self) {
+        #[cfg(test)]if let Some(entries)=&self.desktop_test_entries{self.desktop_entries=entries.clone();return;}
         self.desktop_entries = desktop::enumerate_desktop();
         let mut known: HashSet<String> = self.desktop_entries.iter().map(|e| e.key.to_lowercase()).collect();
         for key in self.config.fences.iter().chain(&self.config.released_items).filter(|f| f.is_desktop()).flat_map(|f| &f.members) {
@@ -1156,6 +1213,9 @@ impl DesktopHost {
     /// Re-reads desktop items and distributes them into desktop fences.
     pub fn refresh_desktop(&mut self) {
         self.refresh_desktop_entries();
+        self.redistribute_desktop_entries();
+    }
+    fn redistribute_desktop_entries(&mut self){
         // Items created/dropped for a specific fence join it once they appear.
         self.pending.retain(|(name, _, t)| t.elapsed() < Duration::from_secs(if name == "*" { 10 } else { 30 }));
         let mut assignments: Vec<(u64, String)> = Vec::new();
@@ -1170,26 +1230,51 @@ impl DesktopHost {
                 assignments.push((fence, entry.key.clone()));
             }
         }
-        let first_run = self.known.is_empty();
+        let first_run = !self.desktop_snapshot_initialized;
         self.known = self.desktop_entries.iter().map(|e| e.key.clone()).collect();
+        self.desktop_snapshot_initialized=true;
         if !first_run {
-            for (fence, key) in assignments { self.config.assign(fence, &[key], None); self.schedule_save(); }
+            for (fence, key) in assignments { self.config.assign_exact(fence, &[key], None); self.schedule_save(); }
         }
         let infos: Vec<ItemInfo> = self.desktop_entries.iter().map(item_info).collect();
+        if self.config.settings.organize {
+            let monitor=primary_monitor();let width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);let height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
+            if width<96||height<104{return;}
+            let mut occupied:Vec<_>=self.config.fences.iter().chain(&self.config.released_items).filter(|item|item.placement.monitor==monitor.name&&!item.is_hidden_tab())
+                .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
+            let mut planned=self.config.clone();
+            let changed=planned.try_reconcile_uncollected(&infos,|_|{
+                let cell=desktop_item_position(Bounds::new(24,24,96,104),width,height,&occupied).ok_or(())?;occupied.push(cell);
+                Ok::<Placement,()>(Placement{monitor:monitor.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
+            });
+            let Ok(changed)=changed else{
+                if self.config.settings.icons_hidden_by_zsdesk{self.restore_desktop();self.notify_error("桌面空间不足，已恢复系统桌面图标；原格子布局仍保留。");}
+                return;
+            };
+            if changed{self.config=planned;self.schedule_save();self.sync_windows();}
+        }
         let groups = self.config.distributed_items(&infos);
         for (fence, indices) in self.config.fences.iter().zip(groups) {
             if !fence.is_desktop() { continue; }
             if let Some(win) = self.fences.iter_mut().find(|w| w.id == fence.id) {
+                let focused=win.focus.and_then(|index|win.entries.get(index)).map(|entry|entry.key.clone());
+                let anchor=win.anchor.and_then(|index|win.entries.get(index)).map(|entry|entry.key.clone());
                 win.entries = indices.into_iter().map(|i| self.desktop_entries[i].clone()).collect();
                 let keys: HashSet<String> = win.entries.iter().map(|e| e.key.clone()).collect();
                 win.selection.retain(|k| keys.contains(k));
-                win.focus = win.focus.filter(|&f| f < win.entries.len());
+                win.focus = focused.and_then(|key|win.entries.iter().position(|entry|entry.key==key));
+                win.anchor = anchor.and_then(|key|win.entries.iter().position(|entry|entry.key==key));
                 win.clamp_scroll(fence);
             }
         }
         for item in &self.config.released_items {
             if let Some(win) = self.fences.iter_mut().find(|win| win.id == item.id) {
-                let entries: Vec<_> = self.desktop_entries.iter().filter(|entry| item.members.iter().any(|key| key.eq_ignore_ascii_case(&entry.key))).cloned().collect();
+                let entries: Vec<_> = item.members.iter().filter_map(|key|{
+                    self.desktop_entries.iter().find(|entry|&entry.key==key).or_else(||{
+                        let mut aliases=self.desktop_entries.iter().filter(|entry|entry.key.eq_ignore_ascii_case(key));
+                        let first=aliases.next();if aliases.next().is_none(){first}else{None}
+                    }).cloned()
+                }).collect();
                 win.entries = entries;
                 win.selection.retain(|key| win.entries.iter().any(|entry| entry.key == *key));
                 win.focus = win.focus.filter(|index| *index < win.entries.len());
@@ -1212,14 +1297,20 @@ impl DesktopHost {
         let height = 104;
         let work_width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);
         let work_height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
-        let origin=Bounds::new(unscale(point.x-monitor.work.left,monitor.dpi),unscale(point.y-monitor.work.top,monitor.dpi),width,height);
+        let pointer=(unscale(point.x-monitor.work.left,monitor.dpi),unscale(point.y-monitor.work.top,monitor.dpi));
         let mut occupied:Vec<Bounds>=self.config.fences.iter().chain(&self.config.released_items)
             .filter(|item|item.placement.monitor==monitor.name && !item.is_hidden_tab()
-                && !item.members.iter().any(|member|keys.iter().any(|key|member.eq_ignore_ascii_case(key))))
+                && !(self.config.is_released(item.id)&&item.members.iter().any(|member|keys.iter().any(|key|member==key))))
             .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
+        let offsets:Vec<_>=keys.iter().enumerate().map(|(index,key)|self.drag_geometry.iter().find(|(name,_)|name==key)
+            .map(|(_,bounds)|*bounds).unwrap_or(Bounds::new(-48+(index as i32%8)*96,-24+(index as i32/8)*104,width,height))).collect();
+        let Some(positions)=super::drag_placement::place(&offsets,pointer,(work_width,work_height),&occupied)else{
+            if self.config.settings.icons_hidden_by_zsdesk&&keys.iter().any(|key|!self.fences.iter().any(|window|window.entries.iter().any(|entry|&entry.key==key))){self.restore_desktop();}
+            return Err("桌面可用空间不足，无法放置这组图标；文件仍保留在磁盘上。".into());
+        };
         let mut planned=Vec::new();let mut unique=HashSet::new();
-        for key in keys {
-            if !unique.insert(key.to_lowercase()){continue;}
+        for (key,position) in keys.iter().zip(positions) {
+            if !unique.insert(key.clone()){continue;}
             if desktop::entry_from_parsing_name(key).is_none() {
                 self.config=original;self.refresh_desktop();
                 let unseen=keys.iter().any(|key|!self.fences.iter().any(|window|
@@ -1227,9 +1318,8 @@ impl DesktopHost {
                 if unseen&&self.config.settings.icons_hidden_by_zsdesk {self.restore_desktop();}
                 return Err("所选项目已移动或不可用，未更改分组。".into());
             }
-            let position=desktop_item_position(origin,work_width,work_height,&occupied);
-            let placement = Placement { monitor: monitor.name.clone(), x:position.x, y:position.y,width,height };
-            planned.push(self.config.release_item(key.clone(), placement));
+            let placement = Placement { monitor: monitor.name.clone(), x:position.x, y:position.y,width:position.w,height:position.h };
+            planned.push(self.config.release_item_exact(key.clone(), placement));
             occupied.push(position);
         }
         let publish=(||->Result<(),String>{
@@ -1278,6 +1368,7 @@ impl DesktopHost {
         let result = desktop::enumerate_folder(&path);
         let win = &mut self.fences[index];
         let path_changed = win.notify_path.as_ref() != Some(&path);
+        if path_changed{win.advance_operation_epoch();}
         let focused_key = win.focus.and_then(|i| win.entries.get(i)).map(|e| e.key.clone());
         let anchor_key = win.anchor.and_then(|i| win.entries.get(i)).map(|e| e.key.clone());
         let (entries, message) = match result {
@@ -1319,10 +1410,10 @@ impl DesktopHost {
 
     // ---- placement ---------------------------------------------------------
 
-    fn store_rect(&mut self, id: u64, rect: RECT) {
+    fn store_rect(&mut self, id: u64, rect: RECT, resized: bool) {
         let Some(fence) = self.config.fence_mut(id) else { return };
         let peeking = self.fences.iter().any(|w| w.id == id && w.peek);
-        let keep_height = (fence.collapsed && !peeking).then_some(fence.placement.height);
+        let keep_height = (fence.collapsed && (!peeking || !resized)).then_some(fence.placement.height);
         fence.placement = from_screen(rect, keep_height);
         self.config.sync_group(id);
         self.schedule_save();
@@ -1392,13 +1483,22 @@ impl DesktopHost {
                 self.render(id);
                 return After::Nothing;
             }
-            Some(Interaction::Press { index: item, cursor }) => {
+            Some(Interaction::Press { key, cursor }) => {
+                let Some(item)=win.entries.iter().position(|entry|entry.key==key)else{win.interaction=None;return After::Nothing;};
                 let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) };
                 if (point.x - cursor.x).abs() > threshold || (point.y - cursor.y).abs() > threshold {
                     win.interaction = None;
                     if !win.selection.contains(&win.entries[item].key) {
                         win.selection = HashSet::from([win.entries[item].key.clone()]);
                     }
+                    let hwnd=win.hwnd;let dpi=win.dpi;let standalone=win.standalone;
+                    let mut anchor=cursor;let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(hwnd,&mut anchor)};
+                    self.drag_geometry=if standalone{
+                        self.fences.iter().filter(|window|window.standalone&&!window.selection.is_empty()).flat_map(|window|{
+                            let rect=window.window_rect();let item_dpi=window.dpi;window.selected_entries().into_iter().map(move|entry|(entry.key.clone(),Bounds::new(
+                                unscale(rect.left-anchor.x,dpi),unscale(rect.top-anchor.y,dpi),unscale(rect.right-rect.left,item_dpi),unscale(rect.bottom-rect.top,item_dpi))))
+                        }).collect()
+                    }else{Vec::new()};
                     return After::Drag { fence: id };
                 }
                 return After::Nothing;
@@ -1470,6 +1570,7 @@ impl DesktopHost {
 
     /// Rolls a collapsed fence down (`open`) or back up to its title bar.
     pub fn peek(&mut self, id: u64, open: bool) {
+        if !open&&self.interaction_holds_open(id){return;}
         let Some(index) = self.win_index(id) else { return };
         let Some(fence) = self.config.fence(id).cloned() else { return };
         let win = &mut self.fences[index];
@@ -1493,17 +1594,39 @@ impl DesktopHost {
         let Some(index) = self.win_index(id) else { return };
         let win = &self.fences[index];
         if !win.peek { let _ = unsafe { KillTimer(Some(win.hwnd), TIMER_PEEK) }; return; }
-        if win.interaction.is_some() || win.rename.is_some() || win.drop_hover.is_some() { return; }
+        if self.interaction_holds_open(id)||win.interaction.is_some() || win.rename.is_some() || win.drop_hover.is_some()||win.notice.as_ref().is_some_and(|(_,until)|Instant::now()<*until) { return; }
         let mut cursor = POINT::default();
-        let _ = unsafe { GetCursorPos(&mut cursor) };
-        let r = win.window_rect();
-        let inside = cursor.x >= r.left && cursor.x < r.right && cursor.y >= r.top && cursor.y < r.bottom;
+        if unsafe { GetCursorPos(&mut cursor) }.is_err(){return;}
         // Keep it open while one of its menus is showing.
         let mut gui = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
         let thread = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
         let menu_open = zsdesk_windows::flyout::is_open()
             || unsafe { GetGUIThreadInfo(thread, &mut gui) }.is_ok() && (gui.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0)) != 0;
-        if !inside && !menu_open { self.peek(id, false); }
+        self.peek_check_observed(id,cursor,menu_open);
+    }
+    fn peek_check_observed(&mut self,id:u64,cursor:POINT,menu_open:bool){
+        let Some(index)=self.win_index(id)else{return;};let win=&self.fences[index];
+        if !win.peek||self.interaction_holds_open(id)||win.interaction.is_some()||win.rename.is_some()||win.drop_hover.is_some()
+            ||win.notice.as_ref().is_some_and(|(_,until)|Instant::now()<*until){return;}
+        let r=win.window_rect();let inside=cursor.x>=r.left&&cursor.x<r.right&&cursor.y>=r.top&&cursor.y<r.bottom;
+        if (!inside||!self.config.settings.hover_expand)&&!menu_open{self.peek(id,false);}
+    }
+    pub(super) fn begin_modal(&mut self,id:u64){*self.modal_holds.entry(id).or_default()+=1;}
+    pub(super) fn end_modal(&mut self,id:u64){if let Some(count)=self.modal_holds.get_mut(&id){*count=count.saturating_sub(1);if *count==0{self.modal_holds.remove(&id);}}}
+    pub(super) fn menu_started(&mut self,id:u64,generation:u64){self.pending_menu=Some((id,generation));}
+    pub(super) fn menu_finished(&mut self,id:u64,generation:u64){if self.pending_menu==Some((id,generation)){self.pending_menu=None;}}
+    pub(super) fn menu_cancelled(&mut self){self.pending_menu=None;}
+    pub(super) fn can_start_desktop_selection(&self)->bool{
+        self.config.settings.organize&&self.config.settings.icons_hidden_by_zsdesk&&self.internal_drag.is_none()&&self.incoming_drag.is_none()
+            &&self.pending_menu.is_none()&&self.modal_holds.values().all(|count|*count==0)
+            &&self.fences.iter().all(|window|window.rename.is_none()&&window.interaction.is_none())
+    }
+    fn interaction_holds_open(&self,id:u64)->bool{
+        let group=self.config.tab_ids(id);
+        self.modal_holds.iter().any(|(fence,count)|*count>0&&group.contains(fence))
+            ||self.pending_menu.is_some_and(|(fence,_)|group.contains(&fence))
+            ||self.internal_drag.as_ref().is_some_and(|(fence,_)|group.contains(fence))
+            ||self.incoming_drag.is_some_and(|fence|group.contains(&fence))
     }
 
     pub fn mouse_leave(&mut self, id: u64) {
@@ -1522,9 +1645,16 @@ impl DesktopHost {
             let others:Vec<u64>=self.fences.iter_mut().filter(|window|window.standalone&&window.id!=id).map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
             for other in others { self.render(other); }
         }
-        let win = &mut self.fences[index];
+        let win = &self.fences[index];
         let g = win.geometry(&fence);
         let hit = g.hit(point.x, point.y, win.dpi, fence.locked, win.collapsed(&fence));
+        // A hover preview is not the size being moved. Keep the title under
+        // the pointer and allow a collapsed fence to reach the bottom edge.
+        if hit == FenceHit::Title && !double && !fence.locked && fence.collapsed && win.peek {
+            self.peek(id, false);
+            self.fences[index].peek_blocked = true;
+        }
+        let win = &mut self.fences[index];
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let mut screen = point;
@@ -1569,7 +1699,7 @@ impl DesktopHost {
                     win.anchor = Some(i);
                 }
                 win.focus = Some(i);
-                win.interaction = Some(Interaction::Press { index: i, cursor: point });
+                win.interaction = Some(Interaction::Press { key:win.entries[i].key.clone(), cursor: point });
                 unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
             }
             FenceHit::Empty => {
@@ -1602,9 +1732,9 @@ impl DesktopHost {
                 if let Some(target) = target { self.merge_fences(id, target); }
                 return After::Nothing;
             }
-            Some(Interaction::Move { .. }) | Some(Interaction::Resize { .. }) => {
+            Some(ref gesture @ Interaction::Move { .. }) | Some(ref gesture @ Interaction::Resize { .. }) => {
                 let rect = win.window_rect();
-                self.store_rect(id, rect);
+                self.store_rect(id, rect, matches!(gesture, Interaction::Resize { .. }));
             }
             Some(Interaction::TabPress { tab, .. }) => {
                 if tab != id { self.switch_tab(tab); }
@@ -1619,10 +1749,10 @@ impl DesktopHost {
                 }
                 self.schedule_save();
             }
-            Some(Interaction::Press { index: item, .. }) => {
+            Some(Interaction::Press { key, .. }) => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                if !ctrl && !shift { win.selection = HashSet::from([win.entries[item].key.clone()]); }
+                if !ctrl && !shift &&win.entries.iter().any(|entry|entry.key==key){ win.selection = HashSet::from([key]); }
             }
             _ => {}
         }
@@ -1641,7 +1771,10 @@ impl DesktopHost {
     pub fn capture_lost(&mut self, id: u64) {
         let Some(index) = self.win_index(id) else { return };
         let _ = unsafe { KillTimer(Some(self.fences[index].hwnd), TIMER_AUTOSCROLL) };
-        if self.fences[index].interaction.take().is_none() { return; }
+        let Some(interaction) = self.fences[index].interaction.take() else { return; };
+        if matches!(interaction, Interaction::Move { .. } | Interaction::Resize { .. }) {
+            self.store_rect(id, self.fences[index].window_rect(), matches!(interaction, Interaction::Resize { .. }));
+        }
         if self.merge_target.is_some() { self.set_merge_target(id, None); }
         self.render(id);
     }
@@ -1947,7 +2080,7 @@ impl DesktopHost {
             entry("列表", "list", true, fence.view == FenceView::List),
         ]));
         let mut sorts = Vec::new();
-        if fence.is_desktop() { sorts.push(entry("手动排列", "sort-manual", true, fence.sort == FenceSort::Manual)); }
+        sorts.push(entry("手动排列", "sort-manual", true, fence.sort == FenceSort::Manual));
         sorts.extend([
             entry("名称", "sort-name", true, fence.sort == FenceSort::Name), entry("类型", "sort-type", true, fence.sort == FenceSort::Type),
             entry("大小", "sort-size", true, fence.sort == FenceSort::Size), entry("修改日期", "sort-modified", true, fence.sort == FenceSort::Modified),
@@ -1960,7 +2093,7 @@ impl DesktopHost {
             let mut rules: Vec<MenuItemSpec> = Category::ALL.iter().filter(|c| **c != Category::Others)
                 .map(|c| entry(c.title(), &format!("rule-{c:?}"), true, fence.rule == Some(*c))).collect();
             rules.push(MenuItemSpec::Separator);
-            rules.push(entry("不自动收取", "rule-none", true, fence.rule.is_none()));
+            rules.push(entry("不自动收取", "rule-none", true, fence.rule.is_none()&&!fence.catch_all));
             rules.push(entry("收取未分类项目", "catch-all", true, fence.catch_all));
             items.push(submenu("自动收取", rules));
         } else {
@@ -1979,10 +2112,7 @@ impl DesktopHost {
     }
 
     fn global_items(&self, s: &zsdesk_core::model::desktop::DesktopSettings) -> Vec<MenuItemSpec> {
-        let expected=std::env::current_exe().ok().and_then(|exe|fence_startup_command(&exe,&self.config_path));
-        let autostart=expected.as_ref().is_some_and(|expected|
-            desktop::autostart_command(crate::edition::desktop_startup_value()).ok().flatten()
-                .is_some_and(|current|desktop::autostart_owned(&current,expected)));
+        let autostart=super::startup_enabled(&self.config_path).unwrap_or(false);
         let transparency = |opacity: u8| {
             let label = if opacity >= 100 { "不透明".to_string() } else { format!("透明度 {}%", 100 - u32::from(opacity)) };
             entry(&label, &format!("opacity-{opacity}"), true, s.opacity == opacity)
@@ -2070,7 +2200,7 @@ impl DesktopHost {
                 self.render_all();
             }
             "toggle-hidden" => self.toggle_hidden(),
-            "double-click" => { self.config.settings.double_click_toggle = !self.config.settings.double_click_toggle; self.schedule_save(); super::update_hook(self.config.settings.double_click_toggle); }
+            "double-click" => { self.config.settings.double_click_toggle = !self.config.settings.double_click_toggle; self.schedule_save(); super::update_hook(self.config.settings.double_click_toggle,self.config.settings.organize); }
             "browse-inside" => { self.config.settings.browse_inside = !self.config.settings.browse_inside; self.schedule_save(); }
             "hover-expand" => { self.config.settings.hover_expand = !self.config.settings.hover_expand; self.schedule_save(); }
             "show-counts" => { self.config.settings.show_counts = !self.config.settings.show_counts; self.schedule_save(); self.render_all(); }
@@ -2091,19 +2221,8 @@ impl DesktopHost {
                 }
             }
             "autostart" => {
-                let Some(command)=std::env::current_exe().ok().and_then(|exe|fence_startup_command(&exe,&self.config_path)) else {
-                    return After::Notice("无法确定当前安装和配置目录，登录启动设置未更改。");
-                };
-                let value=crate::edition::desktop_startup_value();
-                let current=match desktop::autostart_command(value) {
-                    Ok(current)=>current,Err(_)=>return After::Notice("无法读取登录启动设置。"),
-                };
-                if current.as_ref().is_some_and(|current|!desktop::autostart_owned(current,&command)) {
-                    return After::Notice("已有登录启动项属于另一安装或配置，现有设置已保留。");
-                }
-                if desktop::set_autostart(value,&command,current.is_none()).is_err() {
-                    return After::Notice("无法更改登录启动设置，请重新打开设置后重试。");
-                }
+                let current=match super::startup_enabled(&self.config_path){Ok(value)=>value,Err(error)=>{self.notify_error(&format!("无法读取登录启动：{error:#}"));return After::Nothing;}};
+                if let Err(error)=super::set_startup_enabled(&self.config_path,!current){self.notify_error(&format!("登录启动未完成：{error:#}"));}
             }
             "open-zsdesk" => self.open_explorer_args(&[]),
             "quit" => return After::Quit,
@@ -2134,9 +2253,11 @@ impl DesktopHost {
                 if self.config.fence(fid).is_some_and(|f| f.is_desktop()) { self.refresh_desktop(); } else { self.refresh_folder(fid); }
             }
             id if id.starts_with("rule-") || id == "catch-all" => {
+                let keep=if id=="rule-none"{self.win_index(fid).map(|index|self.fences[index].entries.iter().map(|entry|entry.key.clone()).collect::<Vec<_>>()).unwrap_or_default()}else{Vec::new()};
+                if !keep.is_empty(){self.config.assign_exact(fid,&keep,None);}
                 if let Some(f) = self.config.fence_mut(fid) {
                     if id == "catch-all" { f.catch_all = !f.catch_all; }
-                    else { f.rule = Category::ALL.iter().copied().find(|c| format!("rule-{c:?}") == id); }
+                    else { f.rule = Category::ALL.iter().copied().find(|c| format!("rule-{c:?}") == id);if id=="rule-none"{f.catch_all=false;} }
                 }
                 self.schedule_save();
                 self.refresh_desktop();
@@ -2144,7 +2265,7 @@ impl DesktopHost {
             id if id.starts_with("move-to-") => {
                 if let Some(target) = id[8..].parse::<u64>().ok() {
                     let keys = self.selected_keys(fid);
-                    self.config.assign(target, &keys, None);
+                    self.config.assign_exact(target, &keys, None);
                     self.sync_windows();
                     self.schedule_save();
                     self.refresh_desktop();
@@ -2226,12 +2347,91 @@ impl DesktopHost {
         let fence = self.config.fence(id)?;
         if fence.is_desktop() { desktop::user_desktop() } else { fence.folder().cloned() }
     }
+    pub(super) fn adopt_completed_paths(&mut self,id:u64,paths:&[PathBuf])->Vec<PathBuf>{
+        let Some(folder)=self.target_folder(id)else{return Vec::new();};
+        let mut accepted=Vec::new();let mut seen=HashSet::new();
+        for path in paths{if path.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,&folder))&&seen.insert(path.clone()){accepted.push(path.clone());}}
+        if self.config.fence(id).is_some_and(Fence::is_desktop){
+            let keys:Vec<_>=accepted.iter().map(|path|path.to_string_lossy().into_owned()).collect();
+            if !keys.is_empty(){
+                if self.config.is_released(id){
+                    let point=self.win_index(id).map(|index|{let r=self.fences[index].window_rect();POINT{x:r.left+(r.right-r.left)/2,y:r.top+24}}).unwrap_or_default();
+                    if let Err(error)=self.release_desktop_keys(&keys,point){self.show_notice(id,error);}
+                }else{self.config.assign_exact(id,&keys,None);self.schedule_save();self.sync_windows();}
+            }
+        }
+        accepted
+    }
+    pub(super) fn bind_operation(&self,id:u64)->windows::core::Result<()>{
+        let index=self.win_index(id).ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))?;
+        let window=&self.fences[index];zsdesk_windows::shell::file_transfer::bind_origin(window.hwnd,id as usize,id,window.operation_epoch)
+    }
+    pub(super) fn operation_current(&self,id:u64,origin:&zsdesk_windows::shell::file_transfer::TransferOrigin)->bool{
+        self.win_index(id).is_some_and(|index|{let window=&self.fences[index];origin.view==window.hwnd.0 as isize&&origin.pane==id as usize&&origin.tab==id&&origin.epoch==window.operation_epoch})
+    }
+    pub(super) fn select_completed_paths(&mut self,id:u64,paths:&[PathBuf],rename:bool){
+        let Some(index)=self.win_index(id)else{return;};
+        if self.config.fence(id).is_some_and(Fence::is_hidden_tab){return;}
+        if paths.is_empty(){return;}
+        if self.fences[index].pending_selection.as_ref().is_none_or(|(saved,_,_,_)|saved!=paths){
+            self.fences[index].pending_selection=Some((paths.to_vec(),rename,Instant::now()+Duration::from_secs(8),super::selection_input_generation()));
+            unsafe{SetTimer(Some(self.fences[index].hwnd),TIMER_SELECTION,100,None);}
+        }
+        let matching:Vec<_>=matching_output_indices(&self.fences[index].entries,paths).into_iter().map(|position|(position,self.fences[index].entries[position].key.clone())).collect();
+        let Some((first,key))=matching.first().cloned()else{return;};
+        if matching.len()==paths.len(){self.fences[index].pending_selection=None;let _=unsafe{KillTimer(Some(self.fences[index].hwnd),TIMER_SELECTION)};}
+        let window=&mut self.fences[index];window.selection=matching.into_iter().map(|(_,key)|key).collect();window.focus=Some(first);window.anchor=Some(first);
+        if let Some(config)=self.config.fence(id){let geometry=window.geometry(config);if let Some(cell)=geometry.cells.get(first){
+            if cell.cell.y<geometry.content.y{window.scroll-=(geometry.content.y-cell.cell.y).max(0);}
+            else if cell.cell.bottom()>geometry.content.bottom(){window.scroll+=cell.cell.bottom()-geometry.content.bottom();}
+            window.scroll=window.scroll.clamp(0,geometry.max_scroll);
+        }}
+        self.render(id);
+        let owner=self.fences[index].hwnd;
+        if rename&&paths.len()==1&&unsafe{IsWindowVisible(owner)}.as_bool()&&unsafe{GetForegroundWindow()}==owner{self.begin_rename(id,RenameTarget::Item(key));}
+    }
+    pub(super) fn poll_completed_selection(&mut self,id:u64){
+        let Some(index)=self.win_index(id)else{return;};let Some((paths,rename,until,input))=self.fences[index].pending_selection.clone()else{let _=unsafe{KillTimer(Some(self.fences[index].hwnd),TIMER_SELECTION)};return;};
+        let current=self.target_folder(id);
+        if input!=super::selection_input_generation()||Instant::now()>=until||!paths.iter().all(|path|path.parent().zip(current.as_deref()).is_some_and(|(a,b)|crate::explorer_forwarder::same_path(a,b))){
+            self.fences[index].pending_selection=None;let _=unsafe{KillTimer(Some(self.fences[index].hwnd),TIMER_SELECTION)};return;
+        }
+        self.select_completed_paths(id,&paths,rename);
+    }
+    pub(super) fn show_notice(&mut self,id:u64,text:String){
+        if let Some(index)=self.win_index(id){self.fences[index].notice=Some((text,Instant::now()+Duration::from_secs(6)));unsafe{SetTimer(Some(self.fences[index].hwnd),TIMER_NOTICE,6000,None);}self.render(id);}
+    }
+    pub(super) fn clear_notice(&mut self,id:u64){if let Some(index)=self.win_index(id){self.fences[index].notice=None;let _=unsafe{KillTimer(Some(self.fences[index].hwnd),TIMER_NOTICE)};self.render(id);}}
+    pub(super) fn menu_layout(&self,id:u64)->Option<zsdesk_core::model::explorer::ShellViewState>{
+        use zsdesk_core::model::explorer::{ShellViewState,ViewSortColumn,ViewPropertyKey};
+        use zsdesk_windows::shell::commands::{PKEY_NAME,PKEY_TYPE,PKEY_SIZE,PKEY_MODIFIED};
+        let fence=self.config.fence(id)?;
+        let key=match fence.sort{FenceSort::Name=>Some(PKEY_NAME),FenceSort::Type=>Some(PKEY_TYPE),FenceSort::Size=>Some(PKEY_SIZE),FenceSort::Modified=>Some(PKEY_MODIFIED),FenceSort::Manual=>None};
+        Some(ShellViewState{mode:if fence.view==FenceView::List{4}else{1},icon_size:fence.icon_size.pixels(),
+            sort_columns:key.into_iter().map(|key|ViewSortColumn{key:ViewPropertyKey{format_id:format!("{:?}",key.fmtid),property_id:key.pid},ascending:!fence.descending}).collect(),..Default::default()})
+    }
+    pub(super) fn apply_menu_layout(&mut self,id:u64,layout:&zsdesk_core::model::explorer::ShellViewState,sort_changed:bool){
+        use zsdesk_windows::shell::commands::{PKEY_NAME,PKEY_TYPE,PKEY_SIZE,PKEY_MODIFIED};
+        let Some(fence)=self.config.fence_mut(id)else{return;};
+        fence.view=if matches!(layout.mode,3|4){FenceView::List}else{FenceView::Icons};
+        if fence.view==FenceView::Icons{fence.icon_size=if layout.icon_size<=32{IconSize::Small}else if layout.icon_size<=48{IconSize::Medium}else{IconSize::Large};}
+        if sort_changed{
+            if let Some(column)=layout.sort_columns.first(){
+                if let Some((_,sort))=[(PKEY_NAME,FenceSort::Name),(PKEY_TYPE,FenceSort::Type),(PKEY_SIZE,FenceSort::Size),(PKEY_MODIFIED,FenceSort::Modified)].into_iter()
+                    .find(|(key,_)|key.pid==column.key.property_id&&format!("{:?}",key.fmtid).eq_ignore_ascii_case(&column.key.format_id)){
+                    fence.sort=sort;fence.descending=!column.ascending;
+                }
+            }
+        }
+        self.schedule_save();
+    }
 
     /// New items appearing on the desktop within the next seconds join `fence`.
     pub fn expect_new_items(&mut self, fence: u64, names: Vec<String>) {
         if !self.config.fence(fence).is_some_and(|f| f.is_desktop()) { return; }
         let now = Instant::now();
-        if names.is_empty() { self.pending.push(("*".into(), fence, now)); }
+        // Empty names never grant a time-based claim over unrelated desktop
+        // files; completed operations supply their exact created identities.
         for name in names { self.pending.push((name.to_lowercase(), fence, now)); }
     }
 
@@ -2263,14 +2463,15 @@ impl DesktopHost {
 
     /// Chooses the Shell drop target under `point` (screen) for fence `id`.
     /// Over another tab's chip the drop goes into that tab.
-    fn drop_target_at(&self, id: u64, point: POINT) -> Option<DropSpot> {
+    fn drop_target_at(&self, id: u64, point: POINT) -> Option<DropSpot> {self.drop_target_with_keys(id,point,0)}
+    fn drop_target_with_keys(&self, id: u64, point: POINT, keys:u32) -> Option<DropSpot> {
         let index = self.win_index(id)?;
         let fence = self.config.fence(id)?;
         let win = &self.fences[index];
         let mut client = point;
         let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(win.hwnd, &mut client) };
         let g = win.geometry(fence);
-        let internal = self.internal_drag.as_ref();
+        let internal = if self.drag_is_internal{self.internal_drag.as_ref()}else{None};
         let hit = g.hit(client.x, client.y, win.dpi, true, win.collapsed(fence));
         if let FenceHit::Item(i) = hit {
             let entry = &win.entries[i];
@@ -2279,28 +2480,42 @@ impl DesktopHost {
                 return Some(DropSpot { hover: i, tab: None, into: id, target: desktop::item_drop_target(win.hwnd, &entry.pidl).ok(), own: false });
             }
         }
-        // A loose file is not a fence-sized destination. Only actual folder
-        // or application drop targets above may accept a drop onto its icon.
-        if win.standalone { return None; }
+        // A desktop move can end over the original icon (a small movement),
+        // or over a non-folder icon. It still changes desktop coordinates;
+        // it never inserts files into the loose icon's membership.
+        if win.standalone {
+            return (keys&(8|32)==0 && internal.is_some_and(|(source,_)|self.config.fence(*source).is_some_and(Fence::is_desktop)))
+                .then_some(DropSpot{hover:usize::MAX,tab:None,into:id,target:None,own:true});
+        }
         let tab = match hit { FenceHit::Tab(i) if win.tabs[i].id != id => Some(i), _ => None };
         let into = tab.map_or(id, |i| win.tabs[i].id);
         let into_fence = self.config.fence(into)?;
         let spot = |target, own| Some(DropSpot { hover: usize::MAX, tab, into, target, own });
         let from_desktop_fence = internal.is_some_and(|(src, _)| self.config.fence(*src).is_some_and(|f| f.is_desktop()));
-        if into_fence.is_desktop() && from_desktop_fence { return spot(None, true); }
-        if !into_fence.is_desktop() && internal.is_some_and(|(src, _)| *src == into) { return spot(None, false); }
+        if keys&(8|32)==0 {
+            if into_fence.is_desktop() && from_desktop_fence { return spot(None, true); }
+            if !into_fence.is_desktop() && internal.is_some_and(|(src, _)| *src == into) { return spot(None, true); }
+        }
         let folder = self.target_folder(into)?;
         spot(desktop::folder_drop_target(win.hwnd, &folder).ok(), false)
     }
 
     pub fn drag_enter(&mut self, id: u64, data: &IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
+        if let Some(previous)=self.incoming_drag{self.drag_leave(previous);}
+        self.drag_is_internal=self.internal_drag_data.as_ref().and_then(|own|own.cast::<IUnknown>().ok()).zip(data.cast::<IUnknown>().ok()).is_some_and(|(own,incoming)|own==incoming);
+        self.incoming_drag=Some(id);
         self.drop_data = Some(data.clone());
         self.drop_delegate = None;
+        if self.config.settings.hover_expand&&self.win_index(id).is_some_and(|index|!self.fences[index].peek_blocked){self.peek(id,true);}
         self.drag_over(id, keys, point, allowed)
     }
 
     pub fn drag_over(&mut self, id: u64, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
-        let Some(DropSpot { hover, tab, into, target, own }) = self.drop_target_at(id, point) else { return DROPEFFECT_NONE };
+        let Some(DropSpot { hover, tab, into, target, own }) = self.drop_target_with_keys(id, point,keys) else {
+            if let Some((_,_,target))=self.drop_delegate.take(){let _=unsafe{target.DragLeave()};}
+            if let Some(index)=self.win_index(id){self.fences[index].drop_hover=None;self.fences[index].drop_tab=None;self.render(id);}
+            return DROPEFFECT_NONE;
+        };
         let pt = POINTL { x: point.x, y: point.y };
         let mut effect = allowed;
         let same = self.drop_delegate.as_ref().is_some_and(|(f, h, _)| *f == into && *h == hover);
@@ -2314,7 +2529,12 @@ impl DesktopHost {
         } else if let Some((_, _, target)) = &self.drop_delegate {
             if unsafe { target.DragOver(MODIFIERKEYS_FLAGS(keys), pt, &mut effect) }.is_err() { effect = DROPEFFECT_NONE; }
         }
-        if own { effect = DROPEFFECT_MOVE; }
+        if own {
+            // OLE's MK_CONTROL flag requests a copy. The previous path always
+            // advertised MOVE, so Ctrl-drag silently removed the item from its
+            // source fence even though the user asked to copy it.
+            effect = if allowed.0 & DROPEFFECT_MOVE.0 != 0 { DROPEFFECT_MOVE } else { DROPEFFECT_NONE };
+        }
         if let Some(index) = self.win_index(id) {
             let show = if effect == DROPEFFECT_NONE || tab.is_some() { None } else { Some(hover) };
             let tab_show = if effect == DROPEFFECT_NONE { None } else { tab };
@@ -2333,52 +2553,90 @@ impl DesktopHost {
     }
 
     pub fn drag_leave(&mut self, id: u64) {
+        if self.incoming_drag.is_some_and(|current|current!=id){return;}
         if let Some((_, _, old)) = self.drop_delegate.take() { let _ = unsafe { old.DragLeave() }; }
+        self.incoming_drag=None;
+        self.drag_is_internal=false;
         self.drop_data = None;
         self.tab_hover = None;
         if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.fences[index].drop_tab = None; self.render(id); }
     }
 
     /// Prepares a drop. Returns the Shell target to call outside the borrow, if any.
-    pub fn take_drop(&mut self, id: u64, data: &IDataObject, point: POINT) -> Option<IDropTarget> {
+    pub fn take_drop(&mut self, id: u64, data: &IDataObject, keys:u32, point: POINT, allowed:DROPEFFECT) -> PreparedDrop {
+        let effect=if self.incoming_drag==Some(id){self.drag_over(id,keys,point,allowed)}else{DROPEFFECT_NONE};
+        if effect==DROPEFFECT_NONE{self.drag_leave(id);return PreparedDrop::Rejected;}
         if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.fences[index].drop_tab = None; }
         self.tab_hover = None;
-        let spot = self.drop_target_at(id, point);
+        let spot = self.drop_target_with_keys(id, point,keys);
         let into = spot.as_ref().map_or(id, |s| s.into);
         let on_tab = spot.as_ref().is_some_and(|s| s.tab.is_some());
-        let own = spot.is_some_and(|s| s.own && s.hover == usize::MAX);
+        let own = spot.as_ref().is_some_and(|s| s.own && s.hover == usize::MAX);
+        let filesystem=spot.as_ref().and_then(|spot|{
+            if spot.hover==usize::MAX{self.target_folder(into)}else{
+                self.win_index(id).and_then(|index|self.fences[index].entries.get(spot.hover)).filter(|entry|entry.is_file_system&&entry.is_container()&&!entry.is_link).and_then(|entry|entry.path.clone())
+            }
+        });
         let delegate = self.drop_delegate.take().map(|(_, _, t)| t);
         self.drop_data = None;
+        self.incoming_drag=None;
+        self.drag_is_internal=false;
         if own {
             if let Some(t) = delegate { let _ = unsafe { t.DragLeave() }; }
-            if let Some((_, keys)) = self.internal_drag.clone() {
+            if let Some((source, dragged_keys)) = self.internal_drag.clone() {
+                if self.config.is_released(into) {
+                    return match self.release_desktop_keys(&dragged_keys,point) {
+                        Ok(_)=>PreparedDrop::Assigned,
+                        Err(error)=>{self.show_notice(source,error);PreparedDrop::Rejected}
+                    };
+                }
                 let before = self.win_index(id).filter(|_| !on_tab).and_then(|i| {
                     let fence = self.config.fence(id)?;
                     let win = &self.fences[i];
                     let mut client = point;
                     let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(win.hwnd, &mut client) };
                     let at = win.geometry(fence).insertion(client.x, client.y);
-                    win.entries.get(at).map(|e| e.key.clone()).filter(|k| !keys.contains(k))
+                    win.entries.iter().skip(at).find(|entry|!dragged_keys.contains(&entry.key)).map(|entry|entry.key.clone())
                 });
-                if let Some(fence) = self.config.fence_mut(into) {
-                    if fence.sort != FenceSort::Manual && before.is_some() { fence.sort = FenceSort::Manual; }
+                if source==into||before.is_some()||self.config.fence(into).is_some_and(|fence|fence.sort==FenceSort::Manual) {
+                    // Pin the complete displayed order before changing just
+                    // the dragged subset; auto-collected rows also need ranks.
+                    let mut order=self.win_index(into).map(|index|self.fences[index].entries.iter().map(|entry|entry.key.clone()).collect::<Vec<_>>()).unwrap_or_default();
+                    if let Some(fence)=self.config.fence_mut(into){
+                    for key in &fence.members {if !order.iter().any(|value|value==key){order.push(key.clone());}}
+                        fence.members=order;fence.sort=FenceSort::Manual;
+                    }
                 }
-                self.config.assign(into, &keys, before.as_deref());
+                if self.config.fence(into).is_some_and(Fence::is_desktop){self.config.assign_exact(into,&dragged_keys,before.as_deref());}
+                else if let Some(fence)=self.config.fence_mut(into){
+                    fence.members.retain(|key|!dragged_keys.contains(key));
+                    let at=before.as_ref().and_then(|key|fence.members.iter().position(|v|v==key)).unwrap_or(fence.members.len());
+                    fence.members.splice(at..at,dragged_keys);fence.sort=FenceSort::Manual;
+                }
                 self.schedule_save();
-                self.refresh_desktop();
+                if self.config.fence(into).is_some_and(Fence::is_desktop){self.refresh_desktop();}else{self.refresh_folder(into);}
             }
             self.render(id);
-            return None;
+            return PreparedDrop::Assigned;
         }
-        // Files dropped into a desktop fence land on the desktop and join this fence.
-        if self.config.fence(into).is_some_and(|f| f.is_desktop()) {
-            let names: Vec<String> = zsdesk_windows::ole::hdrop_paths(data).iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
-            self.expect_new_items(into, names);
+        if effect==DROPEFFECT_MOVE||effect==windows::Win32::System::Ole::DROPEFFECT_COPY {
+            if let Some(destination)=filesystem.filter(|path|ordinary_drop_folder(path)){
+                let paths=zsdesk_windows::ole::hdrop_paths(data);
+                if !paths.is_empty(){
+                    if let Some(index)=self.win_index(into){
+                        if self.bind_operation(into).is_ok(){
+                            if let Some(target)=delegate{let _=unsafe{target.DragLeave()};}
+                            self.render(id);return PreparedDrop::FileSystem{owner:self.fences[index].hwnd,fence:into,paths,destination,moving:effect==DROPEFFECT_MOVE};
+                        }
+                    }
+                }
+            }
         }
         self.render(id);
-        delegate
+        delegate.map_or(PreparedDrop::Rejected,PreparedDrop::Shell)
     }
+    pub(super) fn begin_internal_drag(&mut self,fence:u64,keys:Vec<String>,data:&IDataObject){self.internal_drag=Some((fence,keys));self.internal_drag_data=Some(data.clone());}
+    pub(super) fn end_internal_drag(&mut self){self.internal_drag=None;self.internal_drag_data=None;self.drag_is_internal=false;self.drag_geometry.clear();}
 }
 
 fn fence_hidden_tab(config: &DesktopConfig, id: u64) -> bool { config.fence(id).is_some_and(Fence::is_hidden_tab) }
@@ -2472,7 +2730,7 @@ fn monitor_from_point(point: POINT) -> Monitor {
     monitor_info(monitor).unwrap_or_else(primary_monitor)
 }
 
-fn unscale(v: i32, dpi: u32) -> i32 { ((v as i64 * 96 + dpi as i64 / 2) / dpi as i64) as i32 }
+fn unscale(v: i32, dpi: u32) -> i32 { super::drag_placement::signed_scale(v,96,dpi) }
 
 /// Placement (DIP relative to a monitor work area) → screen rectangle.
 pub fn to_screen(p: &Placement, collapsed: bool) -> RECT {
@@ -2531,11 +2789,15 @@ mod shortcut_tests {
     fn loose_desktop_icon_placement_avoids_fences_and_stays_on_monitor() {
         let origin=Bounds::new(100,100,96,104);
         let occupied=vec![Bounds::new(0,0,192,208)];
-        let cell=desktop_item_position(origin,800,600,&occupied);
+        let cell=desktop_item_position(origin,800,600,&occupied).unwrap();
         assert!(cell.x>=192||cell.y>=208);
         assert!(cell.x>=0&&cell.y>=0&&cell.right()<=800&&cell.bottom()<=600);
-        let outside=desktop_item_position(Bounds::new(-500,900,96,104),800,600,&[]);
+        let outside=desktop_item_position(Bounds::new(-500,900,96,104),800,600,&[]).unwrap();
         assert_eq!((outside.x,outside.y),(0,496));
+        let first=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[]).unwrap();
+        let second=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[first]).unwrap();
+        assert_eq!((second.x,second.y),(first.x,first.y+104));
+        assert!(desktop_item_position(origin,800,600,&[Bounds::new(0,0,800,600)]).is_none());
     }
     #[test]
     fn fence_startup_command_binds_the_exact_profile() {
@@ -2639,6 +2901,7 @@ mod desktop_publish_tests {
         group.members=keys.clone();group.catch_all=true;config.fences.push(group);config.next_id=2;
         let mut fixture=FixtureHost(DesktopHost::new(hwnd,root.join("profile/desktop-fences.json"),root.join("profile/explorer-session.json"),config,Gfx::new("Segoe UI")?));
         let host=&mut fixture.0;
+        host.desktop_test_entries=Some(desktop::enumerate_folder(&files)?);
         host.create_window(1,false).map_err(anyhow::Error::msg)?;host.refresh_desktop();
         ensure!(host.release_desktop_keys(&keys[..2],POINT{x:500,y:300}).map_err(anyhow::Error::msg)?==2,"two loose icons were not published");
         let ids:Vec<_>=host.config.released_items.iter().map(|item|item.id).collect();
@@ -2649,7 +2912,30 @@ mod desktop_publish_tests {
         host.mouse_down(ids[0],point,false);
         let action=host.mouse_move(ids[0],POINT{x:point.x+40,y:point.y});
         ensure!(matches!(action,After::Drag{..})&&host.selected_entries_owned(ids[0]).len()==2,"drag collapsed a multi-selection");
+        let before:Vec<_>=ids.iter().map(|id|host.fences[host.win_index(*id).unwrap()].window_rect()).collect();
+        let start=POINT{x:before[0].left+point.x,y:before[0].top+point.y};
+        let drop_at=POINT{x:start.x+300,y:start.y+120};
+        ensure!(host.release_desktop_keys(&keys[..2],drop_at).map_err(anyhow::Error::msg)?==2,"loose icons could not be repositioned");
+        let after:Vec<_>=ids.iter().map(|id|host.fences[host.win_index(*id).unwrap()].window_rect()).collect();
+        ensure!((after[0].left-before[0].left-300).abs()<=1&&(after[0].top-before[0].top-120).abs()<=1,"drag lost the original pointer hot spot");
+        ensure!(after[1].left-after[0].left==before[1].left-before[0].left&&after[1].top-after[0].top==before[1].top-before[0].top,"multi-drag rearranged selected icons");
+        host.end_internal_drag();
         let _=unsafe{windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture()};
+        // The pointer can remain inside the source icon after crossing the
+        // drag threshold. OLE must accept this as positioning, not a file drop.
+        host.mouse_down(ids[0],point,false);
+        ensure!(matches!(host.mouse_move(ids[0],POINT{x:point.x+12,y:point.y+7}),After::Drag{..}),"small movement did not start drag");
+        let before_small:Vec<_>=ids.iter().map(|id|host.fences[host.win_index(*id).unwrap()].window_rect()).collect();
+        let data=desktop::data_object(host.fences[first].hwnd,&host.selected_pidls(ids[0]))?;
+        host.begin_internal_drag(ids[0],keys[..2].to_vec(),&data);
+        let small=POINT{x:before_small[0].left+point.x+12,y:before_small[0].top+point.y+7};
+        ensure!(host.drag_enter(ids[0],&data,0,small,DROPEFFECT_MOVE)==DROPEFFECT_MOVE,"drop on original icon rejected small desktop movement");
+        ensure!(matches!(host.take_drop(ids[0],&data,0,small,DROPEFFECT_MOVE),PreparedDrop::Assigned),"original icon drop was not positioned");
+        for (index,id) in ids.iter().enumerate(){let actual=host.fences[host.win_index(*id).unwrap()].window_rect();
+            ensure!((actual.left-before_small[index].left-12).abs()<=1&&(actual.top-before_small[index].top-7).abs()<=1,"small movement changed pointer offset or selected-item spacing");
+            ensure!(host.config.fence(*id).unwrap().members.len()==1,"desktop movement changed loose-icon membership");
+        }
+        host.end_internal_drag();drop(data);let _=unsafe{windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture()};
         let window=&host.fences[host.win_index(ids[0]).unwrap()];let mut screen=point;
         unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut screen)}.ok()?;
         ensure!(host.drop_target_at(ids[0],screen).is_none(),"ordinary loose file accepted a fence-membership drop");
@@ -2660,7 +2946,7 @@ mod desktop_publish_tests {
         let group=host.fences.iter().find(|window|window.id==1).context("original group")?;
         ensure!(group.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(&keys[2])),"rollback hid original grouped item");
         for key in &keys {ensure!(fs::read(key)?==b"desktop-publish-fixture","visual transaction changed a file");}
-        Ok(serde_json::json!({"published_icons_visible":true,"multi_selection_drag_preserved":true,"ordinary_file_rejects_membership_drop":true,
+        Ok(serde_json::json!({"published_icons_visible":true,"multi_selection_drag_preserved":true,"small_movement_over_source_icon":true,"ordinary_file_rejects_membership_drop":true,
             "failed_save_rolls_back_windows_and_membership":true,"files_unchanged":true,"real_desktop_modified":false}))
     }
     #[test]

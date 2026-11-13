@@ -19,7 +19,8 @@ impl WindowState {
     }
     pub(super) fn bookmark_rect(&self,index:usize)->LayoutRect{
         self.bookmark_order.iter().position(|&i|i==index).and_then(|slot|self.layout.bookmarks.get(slot).copied())
-            .unwrap_or_else(||{let row=self.layout.bookmarks_row;LayoutRect::new(row.x+self.s(8),row.y+self.s(2),self.s(220).min(row.width-self.s(16)),row.height-self.s(4))})
+            .unwrap_or_else(||{if self.layout.bookmarks_vertical&&!self.layout.bookmark_overflow.is_empty(){return self.layout.bookmark_overflow;}
+                let row=self.layout.bookmarks_row;LayoutRect::new(row.x+self.s(8),row.y+self.s(2),self.s(220).min((row.width-self.s(16)).max(0)),self.s(28).min((row.height-self.s(4)).max(0)))})
     }
     pub(super) fn add_current_bookmark(&mut self) {
         let target = self.current_location().clone();
@@ -181,7 +182,8 @@ impl WindowState {
         // Borderless EDIT inside the rounded text box painted by the chrome.
         let line = self.edit_line_height();
         let pad = self.s(8);
-        let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, rect.width.max(self.s(140)) - pad * 2, line);
+        let width=if self.layout.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))};
+        let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, (width - pad * 2).max(1), line);
         unsafe {
             move_control(self.rename_hwnd, r);
             SendMessageW(self.rename_hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
@@ -218,10 +220,11 @@ impl WindowState {
                 let Some(index)=self.bookmark_index(slot)else{return;};let item=self.session.bookmarks[index].clone();
                 if item.id==id{return;}
                 let rect=self.layout.bookmarks[slot];
-                if item.is_folder&&point.x>=rect.x+rect.width/4&&point.x<rect.right()-rect.width/4{
+                let (at,start,length)=if self.layout.bookmarks_vertical{(point.y,rect.y,rect.height)}else{(point.x,rect.x,rect.width)};
+                if item.is_folder&&at>=start+length/4&&at<start+length-length/4{
                     self.move_bookmark_to(id,Some(item.id),None);
                 }else{
-                    let before=if point.x<rect.x+rect.width/2{Some(item.id)}else{
+                    let before=if at<start+length/2{Some(item.id)}else{
                         self.session.bookmarks.iter().skip(index+1).find(|b|b.parent_id==item.parent_id&&b.id!=id).map(|b|b.id)
                     };self.move_bookmark_to(id,item.parent_id,before);
                 }

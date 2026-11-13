@@ -53,9 +53,9 @@ impl WindowState {
             self.paint_strip(cv, &tab_icons);
             self.paint_nav(cv, address_icon.as_ref());
             self.paint_commands(cv);
-            self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_search_panel(cv);
             self.paint_content(cv);
+            self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_status(cv);
         });
         if result.is_err() { self.icons.values_mut().for_each(|e| e.bitmap = None); }
@@ -90,10 +90,13 @@ impl WindowState {
         let foot = self.sf(6.0);
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
+            if self.hover==Hit::TabSplitter||self.side_tab_resize.is_some(){cv.fill(rf(self.layout.tab_splitter),c(p.hover));}
+            if !self.layout.tab_scroll_thumb.is_empty(){cv.round(rf(self.layout.tab_scroll_thumb),self.sf(4.0),c(if self.hover==Hit::TabScrollbar||self.side_tab_scroll_drag.is_some(){p.text}else{p.text_secondary}));}
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
             cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
             let title=self.session.current_location().title();
-            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(self.layout.tab_list.x as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
+            let title_end=if self.layout.tab_list.is_empty(){self.layout.app_menu.x}else{self.layout.tab_list.x};
+            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(title_end as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
         }
         for (n, slot) in self.layout.tabs.iter().enumerate() {
             let r = rf(slot.rect);
@@ -192,6 +195,10 @@ impl WindowState {
         for (rect, hit, g, enabled) in buttons {
             if enabled { self.button_fill(cv, rect, hit, self.sf(4.0)); }
             cv.glyph(g, rf(rect), self.sf(14.0), if enabled { c(p.text) } else { c(p.text_disabled) });
+        }
+        if !l.command_toggle.is_empty(){
+            self.button_fill(cv,l.command_toggle,Hit::ToggleCommandBar,self.sf(4.0));
+            cv.glyph(if self.session.ui.command_bar.visible{glyph::CHEVRON_UP}else{glyph::CHEVRON_DOWN},rf(l.command_toggle),self.sf(12.0),c(p.text_secondary));
         }
         // Address box.
         let address = rf(l.address);
@@ -299,22 +306,29 @@ impl WindowState {
         let l = &self.layout;
         if l.bookmarks_row.is_empty() { return; }
         self.paint_chrome_layer(cv, rf(l.bookmarks_row));
+        if l.bookmarks_vertical{
+            let r=l.bookmarks_row;cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);
+            cv.text("收藏夹",rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));
+        }
         if self.session.bookmarks.is_empty() {
             let r = rf(l.bookmarks_row);
-            cv.text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹", RectF::new(r.x + self.sf(14.0), r.y, r.w - self.sf(28.0), r.h), &self.ui_style(), c(p.text_secondary));
+            let (text,y,h)=if l.bookmarks_vertical{("拖入文件夹或按 Ctrl+D",l.bookmarks_title.bottom()as f32+self.sf(6.0),self.sf(32.0))}else{("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹",r.y,r.h)};
+            cv.text(text, RectF::new(r.x + self.sf(14.0), y, r.w - self.sf(28.0), h), &self.ui_style(), c(p.text_secondary));
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
             let Some(index)=self.bookmark_index(i)else{continue;};
             if self.rename_id == Some(self.session.bookmarks[index].id) {
-                let r = rf(LayoutRect::new(rect.x, rect.y, rect.width.max(self.s(140)), rect.height));
+                let r = rf(LayoutRect::new(rect.x, rect.y, if l.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))}, rect.height));
                 self.text_box(cv, r, true, false);
                 continue;
             }
             self.button_fill(cv, *rect, Hit::Bookmark(i), self.sf(4.0));
             if let Some(drag)=self.bookmark_drag.filter(|drag|drag.moved){if self.hover==Hit::Bookmark(i){
-                if self.session.bookmarks[index].is_folder&&drag.point.x>=rect.x+rect.width/4&&drag.point.x<rect.right()-rect.width/4{
+                let (at,start,length)=if l.bookmarks_vertical{(drag.point.y,rect.y,rect.height)}else{(drag.point.x,rect.x,rect.width)};
+                if self.session.bookmarks[index].is_folder&&at>=start+length/4&&at<start+length-length/4{
                     cv.stroke_round(rf(*rect),self.sf(4.0),c(p.accent),self.sf(2.0));
-                }else{let x=if drag.point.x<rect.x+rect.width/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
+                }else if l.bookmarks_vertical{let y=if at<start+length/2{rect.y}else{rect.bottom()}as f32;cv.line(rect.x as f32,y,rect.right()as f32,y,c(p.accent),self.sf(2.0));}
+                else{let x=if at<start+length/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
             }}
             let r = rf(*rect);
             let icon = self.sf(ICON_DIP as f32);
@@ -325,7 +339,8 @@ impl WindowState {
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
-            cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));
+            if l.bookmarks_vertical{cv.text("更多收藏…",rf(l.bookmark_overflow),&self.ui_style(),c(p.text));}
+            else{cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));}
         }
         if let Some(index)=self.renamed_bookmark_index(){if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
     }
@@ -368,14 +383,15 @@ impl WindowState {
     fn paint_status(&self, cv: &Canvas) {
         let p = &self.palette;
         let l = &self.layout;
+        let folder_progress=self.folder_sizes.progress();
         if l.status.is_empty() {
             // Transient messages sit at the right end of the command bar.
-            if self.status.is_empty() || l.command_row.is_empty() { return; }
+            if self.status.is_empty()&&folder_progress.is_none() || l.command_row.is_empty() { return; }
             let row = rf(l.command_row);
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+            cv.text(if self.status.is_empty(){folder_progress.as_deref().unwrap_or("")}else{&self.status}, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
                 c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }
@@ -390,9 +406,9 @@ impl WindowState {
         let left = r.x + self.sf(12.0);
         let (w, _) = cv.gfx().measure(&text, &style, r.w);
         cv.text(&text, RectF::new(left, r.y, w + 2.0, r.h), &style, c(p.text_secondary));
-        if !self.status.is_empty() || self.search_progress.is_some() {
+        if !self.status.is_empty() || self.search_progress.is_some() || folder_progress.is_some() {
             let x = left + w + self.sf(24.0);
-            let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
+            let text=if self.status.is_empty(){self.search_progress.as_deref().or(folder_progress.as_deref()).unwrap_or("")}else{&self.status};
             cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
                 c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
@@ -484,10 +500,7 @@ fn resolve_icon(location: &ShellLocation, px: i32) -> Option<icons::OwnedIcon> {
 }
 
 fn clipboard_has_files() -> bool {
-    use windows::Win32::System::{DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW}, Ole::CF_HDROP};
-    if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok() { return true; }
-    let shell = unsafe { RegisterClipboardFormatW(windows::core::w!("Shell IDList Array")) };
-    shell != 0 && unsafe { IsClipboardFormatAvailable(shell) }.is_ok()
+    zsdesk_windows::shell::file_transfer::has_paste_content()
 }
 
 #[cfg(test)]

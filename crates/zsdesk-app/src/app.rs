@@ -323,10 +323,11 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
         let Some(instance)=crate::instance::enter(&config, requested.as_ref(), selection.as_deref())? else {return Ok(());}; Some(instance)
     };
     let loaded = if config.try_exists()? { Some(storage::load(&config)?) } else { None };
-    let fresh = loaded.is_none() || opts.new_window;
     let mut session = loaded.unwrap_or_else(storage::default_session);
     session.normalize();
-    if let Some(location) = requested { activate(&mut session, location, fresh); }
+    // Existing windows receive requests through instance::enter above. A new
+    // window with an explicit target must not resurrect unrelated saved tabs.
+    if let Some(location) = requested { session.secondary_pane=Default::default();activate(&mut session, location, true); }
     else {session.apply_startup_location();}
     window::run(session, config, selection, !opts.classic,opts.new_window,opts.focus_search.then_some(opts.search_settings))
 }
@@ -404,6 +405,17 @@ mod tests {
         activate(&mut s, a, false);
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.active_tab, 0);
+    }
+    #[test]
+    fn explicit_launch_target_does_not_restore_unrelated_saved_tabs(){
+        use zsdesk_core::model::explorer::StartupLocation;
+        for start in [StartupLocation::RestoreSession,StartupLocation::ThisPc,StartupLocation::Folder(r"C:\startup".into())]{
+            let mut session=ExplorerSession::default();session.ui.startup_location=start;
+            activate(&mut session,ShellLocation::Path(r"C:\old".into()),true);
+            session.secondary_pane=Default::default();
+            activate(&mut session,ShellLocation::Path(r"C:\requested".into()),true);
+            assert_eq!(session.tabs.len(),1);assert_eq!(session.current_location(),&ShellLocation::Path(r"C:\requested".into()));
+        }
     }
     #[test]
     fn selection_requires_target_and_keeps_unicode_names() {

@@ -6,9 +6,9 @@ thread_local! {
     static NEXT_INPUT_WATCH: Cell<u64> = const { Cell::new(1) };
 }
 
-struct InputWatch { id:u64, hook:HHOOK, cancelled:Rc<Cell<bool>> }
+pub(super) struct InputWatch { id:u64, hook:HHOOK, cancelled:Rc<Cell<bool>> }
 impl InputWatch {
-    fn new()->Option<Self>{
+    pub(super) fn new()->Option<Self>{
         let hook=unsafe{SetWindowsHookExW(WH_GETMESSAGE,Some(search_input_hook),None,
             windows::Win32::System::Threading::GetCurrentThreadId())}.ok()?;
         let id=NEXT_INPUT_WATCH.with(|next|{let value=next.get();next.set(value.wrapping_add(1).max(1));value});
@@ -19,6 +19,7 @@ impl InputWatch {
         if !installed {let _=unsafe{UnhookWindowsHookEx(hook)};return None;}
         Some(Self{id,hook,cancelled})
     }
+    pub(super) fn changed(&self)->bool{self.cancelled.get()}
 }
 impl Drop for InputWatch {
     fn drop(&mut self){
@@ -120,7 +121,7 @@ impl WindowState{
         std::fs::write(&temp,serde_json::to_vec_pretty(&value)?)?;std::fs::rename(temp,&request.output)?;Ok(())
     }
     pub(super) fn cancel_fast_search(&mut self){
-        if let Some(engine)=&self.fast_search{engine.cancel();}
+        if let Some(engine)=&self.fast_search{engine.cancel_query();}
         self.fast_generation=0;self.fast_submitted=None;self.fast_events.clear();self.search_progress=None;
         self.discard_fast_restore("query cancelled");self.fast_reset_pending=false;self.fast_clearing=None;
         let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};
@@ -322,7 +323,8 @@ impl WindowState{
             let events=self.fast_search.as_ref().map(|engine|engine.poll()).unwrap_or_default();
             if let Some(event)=events.last(){
                 if event.finished{self.show_message(event.error.as_ref().map_or_else(||"自带索引已就绪".to_owned(),|error|format!("索引未完成：{error}")));}
-                else if event.scanning{self.show_message(format!("正在建立自带索引，已处理 {} 项",event.scanned));}
+                else if event.phase==crate::fast_search::IndexPhase::Snapshot{self.show_message("正在读取已有索引…".into());}
+                else if event.scanning{self.show_message(format!("正在更新自带索引，已处理 {} 项",event.scanned));}
             }return;
         }
         if self.fast_events.is_empty(){if let Some(engine)=&self.fast_search{self.fast_events.extend(engine.poll());}}
@@ -413,7 +415,7 @@ fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
 }
 fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
     use crate::fast_search::IndexPhase;
-    match phase{IndexPhase::Starting=>"准备中",IndexPhase::Snapshot=>"建立快照",IndexPhase::CatchingUp=>"同步 USN",
+    match phase{IndexPhase::Starting=>"准备中",IndexPhase::Snapshot=>"读取已有索引",IndexPhase::CatchingUp=>"同步文件变更",
         IndexPhase::Scanning=>"目录补全",IndexPhase::Attributes=>"读取匹配项属性",IndexPhase::Ready=>"就绪",IndexPhase::Paused=>"已暂停"}
 }
 
@@ -462,7 +464,7 @@ fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
             scanning:true,finished:false,truncated:false,error:None,reset:true,backend:BackendKind::Mixed,
             phase:IndexPhase::CatchingUp,volumes:vec![VolumeStatus{root:PathBuf::from(r"C:\"),backend:BackendKind::NativeNtfs,
                 phase:IndexPhase::Ready,indexed:20,checkpoint:Some(10),warning:None}],read_only:true};
-        let text=progress_text(&event,2);for part in ["NTFS","USN","只读","索引记录","C:"]{assert!(text.contains(part));}
+        let text=progress_text(&event,2);for part in ["NTFS","同步文件变更","只读","索引记录","C:"]{assert!(text.contains(part));}
         assert!(!text.contains("唯一文件"));
     }
 }

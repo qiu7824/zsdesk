@@ -30,12 +30,12 @@ fn find(profile:&Path)->Option<HWND>{
         if unsafe{GetPropW(hwnd,PCWSTR(key.as_ptr()))}.0 as usize==1{return Some(hwnd);}previous=Some(hwnd);
     }None
 }
-fn send(hwnd:HWND,args:Vec<OsString>)->Result<()>{
-    let bytes=serde_json::to_vec(&Request{args})?;if bytes.len()>MAX_PACKET{bail!("启动请求过长");}
+fn send(hwnd:HWND,args:&[OsString])->Result<bool>{
+    let bytes=serde_json::to_vec(&Request{args:args.to_vec()})?;if bytes.len()>MAX_PACKET{bail!("启动请求过长");}
     let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid));let _=AllowSetForegroundWindow(pid);}
     let data=COPYDATASTRUCT{dwData:MAGIC,cbData:bytes.len()as u32,lpData:bytes.as_ptr()as*mut _};let mut accepted=0;
     let sent=unsafe{SendMessageTimeoutW(hwnd,WM_COPYDATA,WPARAM(0),LPARAM(&data as*const _ as isize),SMTO_ABORTIFHUNG,2500,Some(&mut accepted))};
-    if sent.0==0||accepted!=1{bail!("ZSdesk 暂时无法接收启动请求");}Ok(())
+    if sent.0==0{bail!("ZSDesk 启动请求未能确认，请稍后重试");}Ok(accepted==1)
 }
 /// Product actions can reuse the host directly instead of starting a launcher.
 pub fn enqueue_local(profile:&Path,mut args:Vec<OsString>)->Result<bool>{
@@ -44,7 +44,7 @@ pub fn enqueue_local(profile:&Path,mut args:Vec<OsString>)->Result<bool>{
     if !args.iter().any(|arg|arg=="--profile-dir"){
         args.extend(["--profile-dir".into(),profile.parent().context("缺少配置目录")?.as_os_str().to_owned()]);
     }
-    send(HWND(*window as*mut _),args)?;Ok(true)
+    if !send(HWND(*window as*mut _),&args)?{bail!("ZSDesk 暂时无法接收启动请求");}Ok(true)
 }
 unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     if message==WM_NCCREATE{
@@ -147,19 +147,27 @@ fn status(profile:&Path,workers:&[Worker],pool:&[WindowWorker],queued:usize,erro
     let value=serde_json::json!({"schema":1,"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"components":components,"last_error":error,
         "window_pool":pool.iter().map(|worker|serde_json::json!({"id":worker.id,"thread_id":worker.thread_id,"active":worker.job.is_some(),"requests":worker.requests,"stopping":worker.ending})).collect::<Vec<_>>(),
         "queued_window_requests":queued,"max_window_threads":MAX_WINDOW_THREADS,"retiring_menu_threads":crate::desktop::pending_menu_threads(),
-        "pending_file_operations":zsdesk_windows::shell::file_transfer::pending_operations(),"pending_extension_workers":crate::context_menu_process::pending_workers()});
+        "pending_file_operations":zsdesk_windows::shell::file_transfer::pending_operations(),"pending_extension_workers":crate::context_menu_process::pending_workers(),
+        "pending_search_workers":crate::fast_search::pending_workers()});
     if let Ok(bytes)=serde_json::to_vec(&value){
         if previous.as_ref()==Some(&bytes){return;}
         if crate::quick_search::control::atomic_write(&profile.with_file_name("runtime-status.json"),&bytes).is_ok(){*previous=Some(bytes);}
     }
 }
 pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
-    let key=property(&profile);let handle=unsafe{CreateMutexW(None,false,PCWSTR(key.as_ptr()))}?;
-    let existed=unsafe{GetLastError()}==ERROR_ALREADY_EXISTS;let _instance=Kernel(handle);
-    if existed{
-        let deadline=Instant::now()+Duration::from_secs(5);
-        loop{if let Some(hwnd)=find(&profile){return send(hwnd,args);}if Instant::now()>deadline{bail!("ZSdesk 正在启动，请稍后重试");}thread::sleep(Duration::from_millis(25));}
-    }
+    let key=property(&profile);let deadline=Instant::now()+Duration::from_secs(5);
+    let _instance=loop{
+        let handle=unsafe{CreateMutexW(None,false,PCWSTR(key.as_ptr()))}?;
+        let existed=unsafe{GetLastError()}==ERROR_ALREADY_EXISTS;let instance=Kernel(handle);
+        if !existed{break instance;}
+        // Do not keep a retiring host's named object alive from this launcher.
+        // Only a confirmed rejection is retried; an unacknowledged send is
+        // returned as an error so a launch can never be submitted twice.
+        drop(instance);
+        if let Some(hwnd)=find(&profile){if send(hwnd,&args)?{return Ok(());}}
+        if Instant::now()>=deadline{bail!("ZSDesk 正在完成窗口切换，请稍后重试");}
+        thread::sleep(Duration::from_millis(25));
+    };
     // COM's first STA must outlive the other STAs. The host pumps messages
     // until every component has released its Shell/Office interfaces.
     unsafe{windows::Win32::System::Ole::OleInitialize(None)}?;let _apartment=Apartment;
@@ -172,9 +180,13 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     LOCAL.set((profile.clone(),hwnd.0 as isize)).map_err(|_|anyhow::anyhow!("应用宿主已初始化"))?;
     ingress.tx.try_send(Request{args}).context("初始启动请求失败")?;
     let (finished_tx,finished_rx)=mpsc::channel::<Notice>();let mut workers:Vec<Worker>=Vec::new();let mut pool:Vec<WindowWorker>=Vec::new();
-    let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;
+    let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;let mut accepted_request=None;
     loop{
-        while !shutting_down&&queued.len()<MAX_QUEUED_WINDOWS{let Ok(request)=rx.try_recv()else{break;};
+        while queued.len()<MAX_QUEUED_WINDOWS{let Some(request)=accepted_request.take().or_else(||rx.try_recv().ok())else{break;};
+            // Draining extension dialogs or STA finalizers must not leave a
+            // profile permanently rejecting new file windows. Retiring workers
+            // remain retired; the new request gets a live/fresh worker.
+            shutting_down=false;
             let kind=if request.args.iter().any(|a|a=="--desktop"){"desktop"}else if request.args.iter().any(|a|a=="--background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
             let destination=hwnd.0 as isize;let finished=finished_tx.clone();serial+=1;let id=serial;
             if kind=="window"{queued.push_back(WindowJob{id,args:request.args});continue;}
@@ -226,7 +238,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         // another window remains alive. Once the last component ends, retire
         // the pool while the host's first STA continues pumping COM messages.
         if !shutting_down&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
-            shutting_down=true;ingress.accepting.set(false);
+            shutting_down=true;
             crate::context_menu_process::shutdown_idle_worker();
             for worker in &mut pool{
                 if !worker.ending{
@@ -238,10 +250,16 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         // COM/TLS finalizers can still need the first STA after component code
         // returns. Keep pumping while the OS thread finishes; never block it.
         if shutting_down{crate::context_menu_process::shutdown_idle_worker();}
-        let retiring_menus=crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers();
+        let retiring_menus=crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers()+zsdesk_windows::shell::pending_packaged_state_workers()
+            +if shutting_down{crate::fast_search::pending_workers()}else{0};
         unsafe{if workers.iter().any(|worker|worker.ending)||pool.iter().any(|worker|worker.ending)||retiring_menus>0{SetTimer(Some(hwnd),1,25,None);}else{let _=KillTimer(Some(hwnd),1);}}
         status(&profile,&workers,&pool,queued.len(),last_error.as_deref(),&mut previous_status);
-        if shutting_down&&workers.is_empty()&&pool.is_empty()&&retiring_menus==0{break;}
+        if shutting_down&&workers.is_empty()&&pool.is_empty()&&retiring_menus==0{
+            // Win32/COM calls above may dispatch an incoming WM_COPYDATA.
+            // Preserve an already-acknowledged request before closing ingress.
+            if let Ok(request)=rx.try_recv(){accepted_request=Some(request);continue;}
+            ingress.accepting.set(false);break;
+        }
         let mut message=MSG::default();let received=unsafe{GetMessageW(&mut message,None,0,0)}.0;
         // Component WM_QUIT belongs to its UI thread. Only component lifetime
         // accounting may end this host, including after COM pumps a quit.

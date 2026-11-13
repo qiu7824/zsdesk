@@ -99,6 +99,26 @@ pub fn validate_hotkey(value: &str) -> Result<String> {
     Ok(chord.to_string().replace("Primary", "Ctrl").replace("Super", "Win"))
 }
 
+pub(super) fn native_hotkey(value:&str)->Result<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS,u32)>{
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let normalized=validate_hotkey(value)?;
+    let chord:ZsAccelerator=normalized.parse().map_err(|error|anyhow::anyhow!("{error}"))?;
+    let mut mods=MOD_NOREPEAT;
+    if chord.uses_primary(){mods|=MOD_CONTROL;}if chord.uses_alt(){mods|=MOD_ALT;}
+    if chord.uses_shift(){mods|=MOD_SHIFT;}if chord.uses_super(){mods|=MOD_WIN;}
+    let key=match chord.key(){
+        ZsAcceleratorKey::Character(value)=>value.to_ascii_uppercase()as u32,
+        ZsAcceleratorKey::Function(n)=>VK_F1.0 as u32+u32::from(n)-1,
+        ZsAcceleratorKey::Enter=>VK_RETURN.0 as u32,ZsAcceleratorKey::Escape=>VK_ESCAPE.0 as u32,
+        ZsAcceleratorKey::Tab=>VK_TAB.0 as u32,ZsAcceleratorKey::Space=>VK_SPACE.0 as u32,
+        ZsAcceleratorKey::Backspace=>VK_BACK.0 as u32,ZsAcceleratorKey::Delete=>VK_DELETE.0 as u32,
+        ZsAcceleratorKey::Up=>VK_UP.0 as u32,ZsAcceleratorKey::Down=>VK_DOWN.0 as u32,
+        ZsAcceleratorKey::Left=>VK_LEFT.0 as u32,ZsAcceleratorKey::Right=>VK_RIGHT.0 as u32,
+        ZsAcceleratorKey::Home=>VK_HOME.0 as u32,ZsAcceleratorKey::End=>VK_END.0 as u32,
+        ZsAcceleratorKey::PageUp=>VK_PRIOR.0 as u32,ZsAcceleratorKey::PageDown=>VK_NEXT.0 as u32,
+    };Ok((mods,key))
+}
+
 pub fn apply(profile: &Path, mut preferences: QuickSearchPreferences) -> Result<Configuration> {
     preferences.hotkey = validate_hotkey(&preferences.hotkey)?;
     if !preferences.enabled { preferences.start_with_windows = false; }
@@ -304,6 +324,12 @@ pub fn status(profile: &Path) -> serde_json::Value {
     #[test] fn global_shortcuts_require_deliberate_modifiers() {
         assert!(validate_hotkey("a").is_err()); assert!(validate_hotkey("Ctrl+Alt+Space").is_ok());
         assert!(validate_hotkey("F12").is_err()); assert!(validate_hotkey("F11").is_ok()); assert!(validate_hotkey("Ctrl+UnknownKey").is_err());
+    }
+    #[test]fn every_saved_hotkey_uses_the_same_native_key_parser(){
+        for key in ["Enter","Escape","Tab","Space","Backspace","Delete","Up","Down","Left","Right","Home","End","PageUp","PageDown","A","1","F1","F24"]{
+            let text=format!("Ctrl+Alt+{key}");assert!(validate_hotkey(&text).is_ok());assert!(native_hotkey(&text).is_ok(),"{text}");
+        }
+        for invalid in ["a","Ctrl+F12","Ctrl+UnknownKey","Ctrl+A+B"]{assert!(native_hotkey(invalid).is_err(),"{invalid}");}
     }
     #[test] fn startup_arguments_preserve_spaces_and_trailing_separators() {
         assert_eq!(quote_argument("a b"), "\"a b\"");

@@ -20,7 +20,7 @@ use zsdesk_core::model::explorer::{PreviewProviderPreference, ShellLocation};
 
 const MAX_HANDLER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
-const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BITMAP_WIDTH: u32 = 1600;
 const MAX_BITMAP_HEIGHT: u32 = 1200;
 const CLASS_NAME: PCWSTR = windows::core::w!("ZSDesk.QuickPreview");
@@ -28,6 +28,9 @@ const RECOLOR_IMAGE:u32=WM_APP+55;
 #[path="image_decode.rs"]
 mod image_decode;
 use image_decode::ImagePreview;
+#[path="media_preview.rs"]
+mod media_preview;
+use media_preview::MediaPreview;
 
 /// Renderer window on its host's STA; production uses a disposable helper process.
 pub(super) struct QuickPreview { state: Rc<PreviewState> }
@@ -39,7 +42,7 @@ impl QuickPreview {
     }
     pub(super) fn window(&self)->HWND{self.state.hwnd.get()}
     pub(super) fn status(&self)->(String,String){
-        let kind=match &*self.state.content.borrow(){Content::Empty=>"information",Content::Handler(preview)=>if preview.rendered.is_some(){"wps"}else{"system"},Content::Text(_)=>"text",Content::Image(_)=>"image"};
+        let kind=match &*self.state.content.borrow(){Content::Empty=>"information",Content::Handler(preview)=>if preview.rendered.is_some(){"wps"}else{"system"},Content::Text(_)=>"text",Content::Image(_)=>"image",Content::Media(_)=>"media"};
         (kind.into(),self.state.notice.borrow().clone())
     }
     pub(super) fn open(owner: HWND, path: &Path) -> Result<Self> {
@@ -142,7 +145,12 @@ impl QuickPreview {
                 Err(error)=>{handler_error=Some(format!("图片预览失败：{error:#}"));None}
             }
         } else {None};
-        let content = content.or_else(||if self.state.allow_system_handler && !is_image_path(path) && metadata.len() <= MAX_HANDLER_BYTES
+        let content=content.or_else(||if media_preview::supported(path)&&self.is_open()&&!image_request_cancelled(path){
+            match MediaPreview::open(hwnd,path,rect,self.state.colors.get().dark,self.state.hover){
+                Ok(media)=>Some(Content::Media(Rc::new(media))),Err(error)=>{handler_error=Some(format!("系统媒体预览不可用：{error:#}。可使用 QuickLook 或默认播放器打开。"));None}
+            }
+        }else{None});
+        let content = content.or_else(||if self.state.allow_system_handler && !is_image_path(path)&&!media_preview::supported(path) && metadata.len() <= MAX_HANDLER_BYTES
             && self.is_open() && !image_request_cancelled(path) {
             match system_preview_with_provider(hwnd, path, rect, self.state.provider,self.state.colors.get()) {
                 Ok(preview) => Some(Content::Handler(preview)),
@@ -218,6 +226,7 @@ impl QuickPreview {
             Content::Handler(_) => ("system", 0, None),
             Content::Text(text) => ("text", 0, Some(text.0)),
             Content::Image(image) => ("image", image.pixels.len(), None),
+            Content::Media(_) => ("media", 0, None),
         };
         PreviewSnapshot { hwnd: self.state.hwnd.get(), kind, image_bytes: bytes, text_child: child,
             notice: self.state.notice.borrow().clone(), summary: self.state.summary.borrow().clone() }
@@ -276,7 +285,7 @@ impl Drop for PreviewDpiScope {
     fn drop(&mut self) { if !self.0.0.is_null() { unsafe { SetThreadDpiAwarenessContext(self.0); } } }
 }
 
-enum Content { Empty, Handler(SystemPreview), Text(TextPreview), Image(ImagePreview) }
+enum Content { Empty, Handler(SystemPreview), Text(TextPreview), Image(ImagePreview),Media(Rc<MediaPreview>) }
 struct TextPreview(HWND);
 impl Drop for TextPreview {
     fn drop(&mut self) { if unsafe { IsWindow(Some(self.0)) }.as_bool() { let _ = unsafe { DestroyWindow(self.0) }; } }
@@ -320,6 +329,8 @@ impl PreviewState {
         }
         self.colors.set(colors);
         zsdesk_windows::theme::set_dark_frame(self.hwnd.get(),colors.dark);
+        let media=match &*self.content.borrow(){Content::Media(media)=>Some(media.clone()),_=>None};
+        if let Some(media)=media{media.set_dark(colors.dark);}
         let text=match &*self.content.borrow(){Content::Text(text)=>Some(text.0),_=>None};
         if let Some(text)=text{zsdesk_windows::theme::theme_control(text,colors.dark);let _=unsafe{InvalidateRect(Some(text),None,true)};}
         if let Some(visuals)=self.handler().and_then(|handler|handler.cast::<IPreviewHandlerVisuals>().ok()){
@@ -350,6 +361,8 @@ impl PreviewState {
         let _dpi = PreviewDpiScope::for_window(self.hwnd.get());
         let handler = self.handler();
         let text = match &*self.content.borrow() { Content::Text(text) => Some(text.0), _ => None };
+        let media=match &*self.content.borrow(){Content::Media(media)=>Some(media.clone()),_=>None};
+        if let Some(media)=media{media.layout(rect);}
         if let Some(handler) = handler { let _ = unsafe { handler.SetRect(&rect) }; }
         if let Some(hwnd) = text {
             let _ = unsafe { MoveWindow(hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) };
@@ -680,9 +693,11 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (
 }
 fn is_text_path(path: &Path) -> bool {
     matches!(extension(path).as_str(), "txt"|"md"|"log"|"csv"|"tsv"|"json"|"toml"|"ini"|"cfg"|"xml"|"yaml"|"yml"|
-        "rs"|"c"|"h"|"cpp"|"hpp"|"py"|"js"|"ts"|"css"|"html"|"htm"|"sql"|"ps1"|"bat"|"cmd"|"sh")
+        "rs"|"c"|"h"|"cpp"|"hpp"|"py"|"js"|"ts"|"css"|"html"|"htm"|"sql"|"ps1"|"bat"|"cmd"|"sh"|
+        "jsx"|"tsx"|"vue"|"svelte"|"scss"|"less"|"go"|"java"|"kt"|"swift"|"cs"|"rb"|"php"|"lua"|"dart"|
+        "srt"|"vtt"|"ass"|"conf"|"properties")
 }
-fn is_image_path(path: &Path) -> bool { matches!(extension(path).as_str(), "png"|"jpg"|"jpeg"|"bmp"|"gif"|"tif"|"tiff"|"webp"|"ico") }
+fn is_image_path(path: &Path) -> bool { matches!(extension(path).as_str(), "png"|"jpg"|"jpeg"|"jpe"|"jfif"|"bmp"|"dib"|"gif"|"tif"|"tiff"|"webp"|"ico"|"jxr"|"wdp"|"hdp"|"heic"|"heif"|"avif"|"dds") }
 fn extension(path: &Path) -> String { path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase() }
 fn file_type(path: &Path) -> String { let ext = extension(path); if ext.is_empty() { "文件".into() } else { format!("{} 文件", ext.to_uppercase()) } }
 fn wide(value: &str) -> Vec<u16> { value.encode_utf16().chain(Some(0)).collect() }
@@ -787,5 +802,7 @@ mod tests {
     fn executable_files_are_not_treated_as_text_or_images() {
         assert!(!is_text_path(Path::new("工具.exe")) && !is_image_path(Path::new("工具.exe")));
         assert!(is_text_path(Path::new("日志.TXT")) && is_image_path(Path::new("图纸.PNG")));
+        for name in ["照片.HEIC","照片.AVIF","扫描.jxr","照片.jfif"]{assert!(is_image_path(Path::new(name)));}
+        for name in ["字幕.srt","页面.vue","组件.tsx"]{assert!(is_text_path(Path::new(name)));}
     }
 }

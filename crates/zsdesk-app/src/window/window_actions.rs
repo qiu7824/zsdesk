@@ -42,6 +42,7 @@ impl WindowState {
     }
     /// Mouse wheel coordinates are screen coordinates even for child HWNDs.
     pub(super) fn wheel_zoom(&mut self, message: &MSG) -> bool {
+        if self.side_tabs_wheel(message){return true;}
         if message.message != WM_MOUSEWHEEL || (message.wParam.0 & 8 == 0 && unsafe{GetKeyState(VK_CONTROL.0 as i32)}>=0) || self.pending.is_some() { return false; }
         if text_input_window(message.hwnd) { return false; }
         let Some(view) = self.browser.as_ref().and_then(|browser| browser.view_window()) else { return false; };

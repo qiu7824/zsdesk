@@ -50,6 +50,7 @@ impl WindowState {
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
         self.deferred_selection=None;
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        zsdesk_windows::shell::file_transfer::clear_origin(self.view_hwnd);
         self.folder_sizes.cancel();
         if !self.background_pane {self.end_address_edit();}
         if self.pending.is_some() {self.queued=Some(request);return;}
@@ -87,7 +88,8 @@ impl WindowState {
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.view_hwnd=self.browser.as_ref().and_then(|b|b.view_window()).unwrap_or_default();
-        if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);}
+        if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);
+            let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}
         let completed_request=self.pending.is_some();
         let completed_tab = self.pending.as_ref().map(|request| request.tab.id).or(self.shown_tab);
         let active_completion = completed_tab == Some(self.session.active_tab().id);
@@ -124,6 +126,8 @@ impl WindowState {
             // Leaving the results: forget the scope and clear the box (unless typing).
             self.search_scope=None; self.search_result=None;
             self.search_controls_mut().origin = None;
+            let scope=if self.session.ui.search_all_files{None}else{super::integrated_search::font_scope::folder_scope(&location)};
+            self.search_controls_mut().scope=scope;
             if !self.background_pane && unsafe {GetFocus()}!=self.search_edit {
                 self.search_controls_mut().draft = Some(String::new());
                 let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())};
@@ -181,6 +185,7 @@ impl WindowState {
             if let Some(index)=self.session.tabs.iter().position(|t|Some(t.id)==self.shown_tab) {self.session.active_tab=index;}
         }
         unsafe {self.rebuild_tabs();}
+        if self.queued.is_none(){if let Some(identity)=self.identity_for_source(self.browser_source){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}}
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
     }
@@ -192,7 +197,11 @@ impl WindowState {
         unsafe {self.rebuild_tabs();self.navigate_current();}
     }
     pub(super) unsafe fn select_tab(&mut self,index:usize) {
-        if index>=self.session.tabs.len() || index==self.session.active_tab {return;}
+        if index>=self.session.tabs.len(){return;}
+        if index==self.session.active_tab{
+            if self.side_tab_first.take().is_some(){self.side_tab_wheel=0;self.relayout();self.invalidate_rect(self.layout.tab_panel);}
+            return;
+        }
         self.end_address_edit();
         unsafe {self.capture_active();}
         self.session.active_tab=index;
@@ -304,6 +313,7 @@ impl WindowState {
         unsafe{self.commit_address_text(&text);}
     }
     pub(super) unsafe fn commit_address_text(&mut self,text:&str) {
+        if text.encode_utf16().count()>32767||text.contains('\0'){self.show_message("路径过长或包含无效字符".into());return;}
         if matches!(self.current_location(),ShellLocation::Shell{parsing_name,pidl:Some(_),..} if parsing_name.trim().is_empty())
             &&text.trim()==self.current_location().address(){
             // A provider label is display-only. Preserve its PIDL when the
@@ -328,6 +338,9 @@ impl WindowState {
         }
         match parse_address(text) {
             Some(location)=>{
+                let location=match resolve_relative_address(location,self.current_location()){
+                    Ok(location)=>location,Err(message)=>{self.show_message(message);return;},
+                };
                 self.end_address_edit();
                 unsafe {self.navigate_to(location);}
                 if let Some(browser)=&self.browser {unsafe {browser.focus();}}
@@ -335,6 +348,13 @@ impl WindowState {
             None=>{self.show_message("请输入文件夹路径".into());}
         }
     }
+}
+fn resolve_relative_address(location:ShellLocation,current:&ShellLocation)->Result<ShellLocation,String>{
+    let ShellLocation::Path(path)=&location else{return Ok(location);};
+    if path.is_absolute(){return Ok(location);}
+    if matches!(path.components().next(),Some(std::path::Component::Prefix(_))){return Err("请输入包含盘符和反斜杠的完整路径".into());}
+    let base=current.as_path().filter(|path|path.is_absolute()).ok_or_else(||"当前位置不是文件系统目录，请输入完整路径".to_string())?;
+    std::path::absolute(base.join(path)).map(ShellLocation::Path).map_err(|error|format!("路径无效：{error}"))
 }
 pub(super) fn parse_address(text:&str)->Option<ShellLocation> {
     parse_address_with(text,|name|std::env::var(name).ok())
@@ -409,7 +429,7 @@ pub(super) fn sftp_to_unc(text:&str)->Option<PathBuf> {
 }
 
 fn strip_scheme<'a>(text:&'a str,schemes:&[&str])->Option<&'a str> {
-    schemes.iter().find_map(|s| (text.len()>=s.len() && text[..s.len()].eq_ignore_ascii_case(s)).then(||&text[s.len()..]))
+    schemes.iter().find_map(|s| text.get(..s.len()).filter(|head|head.eq_ignore_ascii_case(s)).and_then(|_|text.get(s.len()..)))
 }
 
 /// SSHFS-Win (WinFsp) provides the `\\sshfs*` network provider used for SFTP.
@@ -424,6 +444,24 @@ pub(super) fn window_text(hwnd:HWND)->String {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]fn relative_addresses_use_the_visible_folder_not_the_program_directory(){
+        let current=ShellLocation::Path(r"D:\工程\资料".into());
+        assert_eq!(resolve_relative_address(ShellLocation::Path("中文目录".into()),&current).unwrap(),ShellLocation::Path(r"D:\工程\资料\中文目录".into()));
+        assert_eq!(resolve_relative_address(ShellLocation::Path(r"..\图纸".into()),&current).unwrap(),ShellLocation::Path(r"D:\工程\图纸".into()));
+        assert_eq!(resolve_relative_address(ShellLocation::Path(r"\根目录".into()),&current).unwrap(),ShellLocation::Path(r"D:\根目录".into()));
+        assert!(resolve_relative_address(ShellLocation::Path("相对目录".into()),&ShellLocation::ThisPc).is_err());
+        assert!(resolve_relative_address(ShellLocation::Path("C:目录".into()),&current).is_err());
+    }
+    #[test] fn unicode_addresses_never_slice_through_a_character() {
+        for text in [r"D:\中文目录",r"C:\施工日志",r"E:\资料\图纸",r"\\服务器\共享\工程","中文目录","😀文件夹",r"C:\é中\文件"] {
+            assert_eq!(parse_address(text),Some(ShellLocation::Path(text.into())),"{text}");
+            assert_eq!(sftp_to_unc(text),None);assert_eq!(smb_to_unc(text),None);
+        }
+        for prefix in ["", "C:", "C:\\", "\\\\"] {for character in ['中','é','😀','한'] {
+            for count in 1..=10 {let text=format!("{prefix}{}",character.to_string().repeat(count));
+                assert!(parse_address(&text).is_some());assert!(sftp_to_unc(&text).is_none());}
+        }}
+    }
     #[test] fn address_accepts_shell_unc_and_quoted_paths_without_io() {
         assert_eq!(parse_address("  此电脑 "),Some(ShellLocation::ThisPc));
         assert_eq!(parse_address("\"D:\\not-yet-mounted\\folder\""),Some(ShellLocation::Path(PathBuf::from("D:\\not-yet-mounted\\folder"))));

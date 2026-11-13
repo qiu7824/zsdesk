@@ -223,6 +223,7 @@ pub mod glyph {
     pub const SEARCH: &str = ZsIcon::Search.windows_fluent_glyph();
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
+    pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const CHEVRON_DOWN_SMALL: &str = "\u{E96E}";
     pub const CUT: &str = ZsIcon::Cut.windows_fluent_glyph();
     pub const COPY: &str = ZsIcon::Copy.windows_fluent_glyph();

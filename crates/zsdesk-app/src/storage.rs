@@ -45,7 +45,16 @@ pub fn save(path: &Path, session: &ExplorerSession) -> Result<()> {
 
 pub fn save_startup_location(path:&Path,location:&zsdesk_core::model::explorer::StartupLocation)->Result<()> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
-    let mut session=load(path)?;session.ui.startup_location=location.clone();save_unlocked(path,&session)
+    let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.startup_location=location.clone();save_unlocked(path,&session)
+}
+pub fn save_new_tab_location(path:&Path,location:&zsdesk_core::model::explorer::NewTabLocation)->Result<()> {
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.new_tab_location=location.clone();save_unlocked(path,&session)
+}
+pub fn save_context_menu(path:&Path,options:&zsdesk_core::model::explorer::ContextMenuPreferences)->Result<()> {
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=load(path)?;session.ui.context_menu=options.clone();save_unlocked(path,&session)?;
+    crate::context_preferences::publish(path,options);Ok(())
 }
 
 /// A secondary window owns its appearance and bookmarks, while the primary
@@ -94,7 +103,7 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let saved=load(path).ok();let mut next=session.clone();
-    if let Some(saved)=&saved {next.ui.startup_location=saved.ui.startup_location.clone();}
+    if let Some(saved)=&saved {next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();}
     if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
     if let (Some(baseline),Some(saved))=(baseline_bookmarks,&saved){
         next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));
@@ -167,8 +176,27 @@ mod tests {
         let root=std::env::temp_dir().join(format!("zsdesk-startup-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
         fs::create_dir(&root).unwrap();let path=root.join("session.json");let original=default_session();save(&path,&original).unwrap();
         let chosen=StartupLocation::Folder(root.clone());save_startup_location(&path,&chosen).unwrap();
+        let new_tab=zsdesk_core::model::explorer::NewTabLocation::Folder(root.join("新标签"));save_new_tab_location(&path,&new_tab).unwrap();
         save_window_with_shared_preferences(&path,&original,false,&original.ui.search_preferences(),&original.bookmarks).unwrap();
         assert_eq!(load(&path).unwrap().ui.startup_location,chosen);
+        assert_eq!(load(&path).unwrap().ui.new_tab_location,new_tab);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn first_launch_can_save_tab_defaults_before_a_session_exists(){
+        let root=std::env::temp_dir().join(format!("zsdesk-first-tab-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("session.json");
+        save_new_tab_location(&path,&zsdesk_core::model::explorer::NewTabLocation::CurrentFolder).unwrap();
+        assert_eq!(load(&path).unwrap().ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::CurrentFolder);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn stale_window_cannot_restore_hidden_context_commands(){
+        let root=std::env::temp_dir().join(format!("zsdesk-context-save-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("session.json");let original=default_session();save(&path,&original).unwrap();
+        let mut settings=original.ui.context_menu.clone();settings.hidden_commands=vec!["verb:custom-tool".into()];settings.shown_commands=vec!["label:other-tool".into()];
+        save_context_menu(&path,&settings).unwrap();
+        save_window_with_shared_preferences(&path,&original,false,&original.ui.search_preferences(),&original.bookmarks).unwrap();
+        assert_eq!(load(&path).unwrap().ui.context_menu,settings);assert_eq!(crate::context_preferences::current(&path),Some(settings));
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }
     #[test]

@@ -291,7 +291,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown",
 ]
 
 [[package]]
@@ -1032,7 +1032,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zsdesk-app"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-core"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -1062,14 +1062,14 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-platform"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "zsdesk-core",
 ]
 
 [[package]]
 name = "zsdesk-ui"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "zsdesk-core",
  "zsui",
@@ -1077,10 +1077,11 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-windows"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "cc",
+ "roxmltree 0.20.0",
  "serde",
  "serde_json",
  "sha2",

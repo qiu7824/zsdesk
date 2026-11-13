@@ -2,6 +2,7 @@ use super::*;
 use super::search_panel::{SearchCategory,SearchControls,SEARCH_PAGE_SIZE};
 use crate::fast_search::everything::SearchSort;
 use zsdesk_windows::shell::commands::Column;
+#[path="font_scope.rs"]pub(super) mod font_scope;
 
 pub(super) struct SettingsJob{
     result:std::sync::mpsc::Receiver<anyhow::Result<()>>,
@@ -23,8 +24,10 @@ pub(super) struct SubmittedSearch{
 fn expression(raw:&str,controls:&SearchControls)->String{
     let mut terms=Vec::new();
     if let Some(scope)=&controls.scope{
-        let path=scope.to_string_lossy().replace('/',"\\");
-        terms.push(format!("\"{}\\\"",path.trim_end_matches('\\')));
+        if let Some(fonts)=font_scope::expression(scope){terms.push(fonts);}else{
+            let path=scope.to_string_lossy().replace('/',"\\");
+            terms.push(format!("\"{}\\\"",path.trim_end_matches('\\')));
+        }
     }
     let category=controls.category.query_prefix();
     if !category.is_empty(){terms.push(category.to_owned());}
@@ -47,7 +50,7 @@ impl WindowState{
         let fallback = match &location { ShellLocation::Search { query, .. } => query.clone(), _ => String::new() };
         let scope = match &location {
             ShellLocation::Search { scope, .. } => scope.clone(),
-            location if !self.session.ui.search_all_files => location.as_path().map(PathBuf::from),
+            location if !self.session.ui.search_all_files => font_scope::folder_scope(location),
             _ => None,
         };
         let controls = self.search_panel.tabs.entry(id).or_insert_with(|| SearchControls { scope, ..Default::default() });
@@ -93,7 +96,7 @@ impl WindowState{
             self.search_panel.open=true;
             let scope = match self.current_location() {
                 ShellLocation::Search { scope, .. } => scope.clone(),
-                location if !self.session.ui.search_all_files => location.as_path().map(PathBuf::from),
+                location if !self.session.ui.search_all_files => font_scope::folder_scope(location),
                 _ => None,
             };
             if self.search_controls().origin.is_none() { self.search_controls_mut().scope = scope; }

@@ -115,11 +115,16 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
             }
         }
     }
-    let unavailable = if blocked && candidates.is_empty() { "该格式的预览插件已被 Windows 或用户设置禁用。" }
-        else if stale { "此格式的预览关联未能激活对应组件；请检查 Office/WPS 的预览组件注册。" }
-        else if !candidates.is_empty() { "已找到预览组件，但未能显示此文件。" }
-        else { "没有找到此格式的已安装预览插件；安装 Office/WPS 的预览组件后可直接使用。" };
+    let unavailable=unavailable_message(&extension,blocked,stale,!candidates.is_empty());
     Discovery { candidates, unavailable: unavailable.into() }
+}
+fn unavailable_message(extension:&str,blocked:bool,stale:bool,found:bool)->&'static str{
+    if blocked&&!found{return "该格式的预览插件已被 Windows 或用户设置禁用。";}
+    if stale{return "此格式的预览关联未能激活对应组件，请检查该格式预览组件的安装状态。";}
+    if found{return "已找到预览组件，但未能显示此文件。";}
+    if !office_progids(extension,false).is_empty()||!office_progids(extension,true).is_empty(){
+        "未找到此文档格式的预览组件；可安装对应 Office/WPS 组件，或使用 QuickLook。"
+    }else{"未找到此格式的预览组件；可使用 QuickLook 或默认应用打开。"}
 }
 
 #[cfg(test)] mod tests {
@@ -129,5 +134,9 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
         assert!(office_progids(".xlsx", false).iter().all(|value| value.starts_with("Excel.")));
         assert!(office_progids(".pptx", false).iter().all(|value| value.starts_with("PowerPoint.")));
         assert!(office_progids(".exe", false).is_empty());
+    }
+    #[test]fn missing_media_or_pdf_handlers_do_not_recommend_office(){
+        for extension in [".mp4",".mp3",".pdf",".zip",".exe"]{assert!(!unavailable_message(extension,false,false,false).contains("Office"));}
+        assert!(unavailable_message(".docx",false,false,false).contains("Office"));
     }
 }

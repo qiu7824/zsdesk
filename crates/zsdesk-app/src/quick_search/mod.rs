@@ -1,6 +1,7 @@
 //! Shared hotkey/background lifecycle. Search lives in the file-manager window.
 pub mod control;
 mod resident;
+pub(super) mod popup;
 use std::path::{Path,PathBuf};
 use anyhow::{Context,Result};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]

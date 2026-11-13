@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/shell_menu.cpp");
     println!("cargo:rerun-if-changed=native/MenuSelectionSnapshot.h");
     println!("cargo:rerun-if-changed=native/CommandAgility.h");
+    println!("cargo:rerun-if-changed=native/NativeCommandGuard.h");
     println!("cargo:rerun-if-changed=native/MenuCommandBridge.h");
     println!("cargo:rerun-if-changed=native/MenuCommandDispatch.h");
     println!("cargo:rerun-if-changed=native/MixedItemMenu.h");

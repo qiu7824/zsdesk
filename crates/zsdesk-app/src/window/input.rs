@@ -3,7 +3,13 @@ use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec,
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 impl WindowState {
+    unsafe fn new_default_tab(&mut self){
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.new_tab_location=saved.ui.new_tab_location;}
+        let current=self.search_controls().origin.unwrap_or_else(||self.current_location().clone());
+        let location=self.session.ui.new_tab_location.target(&current);unsafe{self.new_tab(location);}
+    }
     pub(super) unsafe fn rebuild_tabs(&mut self) {
+        self.side_tab_first=None;self.side_tab_wheel=0;
         self.relayout();
         unsafe { self.update_address(); }
     }
@@ -27,8 +33,12 @@ impl WindowState {
     pub(super) fn focus_view(&self) { if let Some(browser) = &self.browser { unsafe { browser.focus(); } } }
 
     unsafe fn execute(&mut self, command: Command) {
+        if matches!(command,Command::NewFolder)&&(self.pending.is_some()||self.queued.is_some()){
+            self.show_message("文件夹正在加载，请完成后再操作".into());return;
+        }
+        if matches!(command,Command::NewFolder){zsdesk_windows::shell::file_transfer::note_user_input(self.view_hwnd);}
         match command {
-            Command::NewTab => unsafe { self.new_tab(ShellLocation::ThisPc) },
+            Command::NewTab => unsafe { self.new_default_tab() },
             Command::CloseTab => unsafe { self.close_tab(self.session.active_tab) },
             Command::CloseOtherTabs => if self.session.tabs.len() > 1 { unsafe { self.close_group(self.session.active_tab, false) } },
             Command::ReopenTab => unsafe { self.reopen_tab() },
@@ -50,7 +60,9 @@ impl WindowState {
                     self.cancel_fast_search();
                     self.request_integrated_search(false);
                 } else {
-                    self.capture_active(); self.navigate_current();
+                    self.capture_active();
+                    let result=self.browser.as_ref().map(|browser|browser.current_view().and_then(|view|view.Refresh()));
+                    self.shell_result(result);
                 }
             },
             Command::AddBookmark => self.add_current_bookmark(),
@@ -63,6 +75,7 @@ impl WindowState {
             Command::SwitchPane => {self.activate_pane(!self.active_pane_right);self.focus_view();},
             Command::NewWindow => self.new_window(),
             Command::ToggleFullscreen => self.toggle_fullscreen(),
+            Command::ToggleCommandBar => self.apply_interface_choice("command-bar-visible"),
             Command::FocusNext => self.cycle_focus(false),
             Command::FocusPrevious => self.cycle_focus(true),
             Command::ZoomIn => self.zoom_view(true),
@@ -75,7 +88,8 @@ impl WindowState {
     pub(super) fn shell_result(&mut self, result: Option<windows::core::Result<()>>) {
         if let Some(Err(error)) = result {
             // ERROR_CANCELLED / no selection are not failures worth reporting.
-            if ![0x800704C7u32, 0x80004005, 0x80070490].contains(&(error.code().0 as u32)) { self.show_message(format!("操作失败：{}", error.message())); }
+            if zsdesk_windows::shell::file_transfer::is_cancelled(error.code()){self.show_message("操作已取消".into());}
+            else if error.code().0 as u32!=0x80070490 { self.show_message(format!("操作失败：{}", zsdesk_windows::shell::file_transfer::error_message(&error))); }
         }
         self.refresh_status();
     }
@@ -95,17 +109,19 @@ impl WindowState {
             if touches(old) || touches(hit) { self.invalidate_rect(row); }
         }
         if matches!(old, Hit::Splitter) || matches!(hit, Hit::Splitter) { self.invalidate_rect(self.layout.splitter); }
+        if matches!(old,Hit::TabSplitter)||matches!(hit,Hit::TabSplitter){self.invalidate_rect(self.layout.tab_splitter);}
     }
 
     fn row_of(&self, hit: Hit) -> Option<LayoutRect> {
         Some(match hit {
-            Hit::None | Hit::Splitter | Hit::PaneSplitter => return None,
+            Hit::None | Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter => return None,
+            Hit::TabScrollbar=>self.layout.tab_panel,
             Hit::PaneHeader(index)=>self.layout.pane_headers[index],
             Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab if self.layout.vertical_tabs=>self.layout.tab_panel,
             Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu => self.layout.strip,
             Hit::Search if self.search_panel.open => self.layout.search,
             Hit::SearchPanel(_) => self.layout.search,
-            Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::Address | Hit::Search => self.layout.nav_row,
+            Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::ToggleCommandBar | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
             Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
             Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::Status => self.layout.status,
@@ -125,6 +141,7 @@ impl WindowState {
             Hit::Forward => ("前进 (Alt+右箭头)".into(), self.layout.forward),
             Hit::Up => ("上移到上一级 (Alt+上箭头)".into(), self.layout.up),
             Hit::Refresh => ("刷新 (F5)".into(), self.layout.refresh),
+            Hit::ToggleCommandBar => (format!("{}命令栏 (Ctrl+F1)",if self.session.ui.command_bar.visible{"收起"}else{"展开"}),self.layout.command_toggle),
             Hit::Search => ("搜索文件和文件夹 (Ctrl+F)".into(), self.layout.search),
             Hit::SearchPanel(action) => {
                 let panel = &self.layout.search_panel;
@@ -168,6 +185,7 @@ impl WindowState {
     }
 
     pub(super) fn mouse_move(&mut self, p: POINT, _keys: usize) {
+        if self.side_tabs_mouse_move(p){return;}
         if let Some(mut drag)=self.bookmark_drag {
             let x=unsafe{GetSystemMetricsForDpi(SM_CXDRAG,self.dpi)}.max(1);let y=unsafe{GetSystemMetricsForDpi(SM_CYDRAG,self.dpi)}.max(1);
             if (p.x-drag.start.x).abs()>x||(p.y-drag.start.y).abs()>y{drag.moved=true;}
@@ -233,6 +251,7 @@ impl WindowState {
         let hit = self.layout.hit(p.x, p.y);
         if hit != Hit::Address { self.end_address_edit(); }
         self.pressed = Some(hit);
+        if self.side_tabs_mouse_down(hit,p){return;}
         match hit {
             Hit::Bookmark(slot)=>{
                 if let Some(index)=self.bookmark_index(slot){self.bookmark_drag=Some(BookmarkDrag{id:self.session.bookmarks[index].id,start:p,point:p,moved:false});unsafe{SetCapture(self.hwnd);}}
@@ -257,6 +276,7 @@ impl WindowState {
     pub(super) fn mouse_up(&mut self, p: POINT) {
         let pressed = self.pressed.take();
         let had_capture = unsafe { GetCapture() } == self.hwnd;
+        if self.side_tabs_mouse_up(had_capture){return;}
         if let Some(drag)=self.bookmark_drag.take(){
             if drag.moved{if had_capture{let _=unsafe{ReleaseCapture()};}self.finish_bookmark_drag(drag.id,p);self.invalidate_rect(self.layout.bookmarks_row);return;}
         }
@@ -275,13 +295,14 @@ impl WindowState {
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         match hit {
             Hit::TabClose(i) => unsafe { self.close_tab(i) },
-            Hit::NewTab => unsafe { self.new_tab(ShellLocation::ThisPc) },
+            Hit::NewTab => unsafe { self.new_default_tab() },
             Hit::TabList => unsafe { self.tab_list_menu() },
             Hit::AppMenu => unsafe { self.app_menu() },
             Hit::Back => unsafe { self.execute(Command::Back) },
             Hit::Forward => unsafe { self.execute(Command::Forward) },
             Hit::Up => unsafe { self.execute(Command::Up) },
             Hit::Refresh => unsafe { self.execute(Command::Refresh) },
+            Hit::ToggleCommandBar => self.apply_interface_choice("command-bar-visible"),
             Hit::SearchPanel(action) => unsafe { self.search_panel_action(action) },
             Hit::Address => if let Some(part) = self.crumb_at(p.x, p.y) { unsafe { self.crumb_click(part, ctrl); } },
             Hit::Command(id) => unsafe { self.command(id) },
@@ -386,6 +407,10 @@ impl WindowState {
     // ---- command bar ----------------------------------------------------
 
     pub(super) unsafe fn command(&mut self, id: CommandId) {
+        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::New|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
+            self.show_message("文件夹正在加载，请完成后再操作".into());return;
+        }
+        zsdesk_windows::shell::file_transfer::note_user_input(self.view_hwnd);
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let hwnd = self.hwnd;
         match id {
@@ -393,7 +418,8 @@ impl WindowState {
                 let rect = self.layout.command_rect(id).unwrap_or_default();
                 let point = self.screen_point(rect.x, rect.bottom());
                 let result = self.browser.as_ref().zip(self.identity_for_source(self.browser_source)).map(|(b,identity)|{
-                    let view=unsafe{b.current_view()?};super::context_menu::show_new(hwnd,&view,identity,point)
+                    let view=unsafe{b.current_view()?};let preferences=self.menu_source_preferences(identity.source)?;
+                    super::context_menu::show_new(hwnd,&view,identity,point,preferences)
                 });
                 self.shell_result(result);
             }
@@ -423,11 +449,14 @@ impl WindowState {
     }
 
     pub(super) fn set_panes(&mut self, preview: bool, details: bool) {
+        self.set_panes_with_rebuild(preview,details,false);
+    }
+    pub(super) fn set_panes_with_rebuild(&mut self,preview:bool,details:bool,force:bool){
         let details_changed=self.session.ui.show_details!=details;
         self.session.ui.show_preview = preview;
         self.session.ui.show_details = details;
         self.save();
-        if !details_changed {unsafe{self.resize();}return;}
+        if !details_changed&&!force {unsafe{self.resize();}return;}
         // IExplorerBrowser reads pane visibility only while initializing, so the
         // view is recreated and returns to the same folder, selection and layout.
         unsafe { self.capture_active(); }
@@ -493,7 +522,26 @@ impl WindowState {
         let current = browser.sort();
         let group = browser.group().map(to_key);
         let anchor = self.layout.command_rect(CommandId::Sort);
-        let choice = popup(self.hwnd, &menus::sort_menu(current.map(|(c, a)| (to_key(c), a)), group), anchor);
+        let mut spec=menus::sort_menu(current.map(|(c, a)| (to_key(c), a)), group);
+        spec.items.push(MenuItemSpec::Separator);
+        let ordinary=self.current_location().as_path().is_some()&&self.pending.is_none();
+        spec.items.push(menus::entry("计算并按总大小排序","folder-size-sort",ordinary,false));
+        spec.items.push(menus::entry("文件夹大小概览…","folder-size-ranking",ordinary,false));
+        let choice = popup(self.hwnd, &spec, anchor);
+        if choice.as_deref()==Some("folder-size-sort"){
+            if !self.session.ui.everything_folder_sizes{self.session.ui.everything_folder_sizes=true;if !self.persist_search_preferences(){return;}self.cancel_folder_sizes();}
+            let result=self.browser.as_ref().map(|browser|{browser.set_view_mode(4,16)?;zsdesk_windows::shell::folder_totals::ensure_size_visible(&unsafe{browser.current_view()}?) });
+            if result.as_ref().is_some_and(|result|result.is_err()){self.shell_result(result);return;}
+            self.poll_folder_sizes();
+            if self.folder_sizes.active(){self.shell_result(self.browser.as_ref().map(|browser|browser.set_sort(Column::Size,false)));}
+            return;
+        }
+        if choice.as_deref()==Some("folder-size-ranking"){
+            if let (Some(identity),Some(directory))=(self.identity_for_source(self.browser_source),self.current_location().as_path()){
+                if let Err(error)=super::folder_sizes::show_ranking(self.hwnd,identity,&self.config_path,directory){self.show_message(format!("无法打开文件夹总大小：{error:#}"));}
+            }
+            return;
+        }
         let Some(browser) = &self.browser else { return };
         let (column, ascending) = current.unwrap_or((Column::Name, true));
         let result = match choice.as_deref() {
@@ -602,6 +650,7 @@ impl WindowState {
     fn apply_menu_toggle(&mut self,id:&str)->bool{
         if id.starts_with("context-menu-") || id.starts_with("context-action-") {
             if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
+                if !self.persist_context_menu(){return true;}
                 self.modern=crate::context_preferences::modern(&self.session.ui.context_menu);
                 let options=crate::context_preferences::native(&self.session.ui.context_menu);
                 zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
@@ -625,16 +674,19 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.startup_location=saved.ui.startup_location;}
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.startup_location=saved.ui.startup_location;
+            self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
         // Toggles are applied inside; only an action closes the menu and reaches the match.
         let choice = popup_persistent(hwnd, &spec, anchor, &mut |id| self.apply_menu_toggle(id).then(||self.app_menu_spec()));
         match choice.as_deref() {
-            Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
+            Some("new-tab") => unsafe { self.new_default_tab() },
             Some("new-window")=>self.new_window(),
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(format!("无法打开诊断日志：{error}"));},
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
+            Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(format!("无法打开快速搜索：{error:#}"));},
+            Some("manage-context-commands")=>self.load_context_catalog(),
             Some(id @ ("startup-restore"|"startup-this-pc"|"startup-folder")) => {
                 use zsdesk_core::model::explorer::StartupLocation;
                 let location=match id {
@@ -646,6 +698,12 @@ impl WindowState {
                     Ok(())=>{self.session.ui.startup_location=location;self.show_message("默认位置已保存，下次重新打开窗口时生效".into());},
                     Err(error)=>self.show_message(format!("默认位置未保存：{error}")),
                 }
+            },
+            Some(id @ ("new-tab-this-pc"|"new-tab-current"|"new-tab-folder"))=>{
+                use zsdesk_core::model::explorer::NewTabLocation;
+                let location=match id{"new-tab-this-pc"=>NewTabLocation::ThisPc,"new-tab-current"=>NewTabLocation::CurrentFolder,
+                    _=>{let Some(path)=zsdesk_windows::desktop::pick_folder(self.hwnd,"选择新标签页打开的文件夹")else{return;};NewTabLocation::Folder(path)}};
+                match storage::save_new_tab_location(&self.config_path,&location){Ok(())=>{self.session.ui.new_tab_location=location;self.show_message("新标签页位置已保存".into());},Err(error)=>self.show_message(format!("新标签页位置未保存：{error}"))}
             },
             Some("search-rebuild-index") => self.rebuild_search_index(),
             Some("dual-pane") => self.toggle_dual_pane(),
@@ -660,6 +718,7 @@ impl WindowState {
             Some(id) if id.starts_with("appearance-") => if crate::edition::THEMED { self.apply_appearance_choice(id); },
             Some(id) if id.starts_with("context-menu-") || id.starts_with("context-action-") => {
                 if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
+                    if !self.persist_context_menu(){return;}
                     self.modern=crate::context_preferences::modern(&self.session.ui.context_menu);
                     let options=crate::context_preferences::native(&self.session.ui.context_menu);
                     zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
@@ -682,36 +741,32 @@ impl WindowState {
             Some("folder-options") => open_folder_options(),
             Some(id) if menus::apply_interface_setting(&mut self.session.ui.clone(), id) => self.apply_interface_choice(id),
             Some("shortcuts") => {
-                let text = if crate::edition::DESKTOP { SHORTCUTS } else { SHORTCUTS.split("\n\n桌面格子").next().unwrap_or(SHORTCUTS) };
-                let text = wide(text);
-                unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("键盘快捷键").as_ptr()), MB_OK | MB_ICONINFORMATION); }
+                let text = shortcut_help_text();
+                if let Err(error)=crate::utility_panel::shortcuts(self.hwnd,&self.config_path,text){self.show_message(format!("无法打开快捷键窗口：{error:#}"));}
             }
             Some("about") => {
-                let mut parts = vec!["多标签文件管理器"];
-                if crate::edition::NETWORK { parts.push("FTP / SSH 访问"); }
-                if crate::edition::DESKTOP { parts.push("桌面格子"); }
-                let text = wide(&format!("ZSDesk {} {}\n\nWindows 11 风格：{}。\n界面设计基于 ZSUI，内容区为系统 Shell 视图。", env!("CARGO_PKG_VERSION"), crate::edition::name(), parts.join("、")));
-                unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("关于 ZSDesk").as_ptr()), MB_OK | MB_ICONINFORMATION); }
+                if let Err(error)=crate::utility_panel::about(self.hwnd,&self.config_path){self.show_message(format!("无法打开关于窗口：{error:#}"));}
             }
             _ => {}
         }
     }
 
-    fn apply_appearance_choice(&mut self, id: &str) {
+    pub(super) fn apply_appearance_choice(&mut self, id: &str) {
         if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
         let old=self.session.ui.appearance.clone();
         if !menus::apply_appearance(&mut self.session.ui.appearance,id) || self.session.ui.appearance==old { return; }
         self.apply_theme();self.theme_children();
         if old.color_scheme!=self.session.ui.appearance.color_scheme {
-            self.set_panes(self.session.ui.show_preview,self.session.ui.show_details);
+            self.rebuild_color_scheme_views();
         }
         self.save();self.relayout();self.position_children();self.invalidate();
         let _=crate::quick_search::control::signal(&self.config_path,"reload");
     }
 
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
-    fn apply_interface_choice(&mut self, id: &str) {
+    pub(super) fn apply_interface_choice(&mut self, id: &str) {
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
+        if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
@@ -792,7 +847,7 @@ impl WindowState {
         if index >= self.session.tabs.len() { return; }
         let spec = menus::tab_menu(self.session.tabs.len(), index, !self.closed_tabs.is_empty(),self.session.tabs[index].locked);
         match popup(self.hwnd, &spec, None).as_deref() {
-            Some("new") => unsafe { self.new_tab(ShellLocation::ThisPc) },
+            Some("new") => unsafe { self.new_default_tab() },
             Some("duplicate") => { let location = self.session.tabs[index].current().clone(); unsafe { self.new_tab(location); } }
             Some("bookmark") => { let l = self.session.tabs[index].current().clone(); self.add_bookmark(l.title(), l); }
             Some("lock")=>{
@@ -842,7 +897,7 @@ impl WindowState {
 
 }
 
-const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())

@@ -97,8 +97,10 @@ fn registry_text(root:HKEY,key:&str,value:Option<&str>)->Option<String>{
 fn registry_path(root:HKEY,key:&str,value:Option<&str>)->Option<PathBuf>{
     registry_text(root,key,value).map(|value|PathBuf::from(value.trim_matches('"')))
 }
-pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
-    if let Some(path)=configured.filter(|p|p.is_absolute()&&p.is_file()){return Some(path.into());}
+fn installed_executable(configured:Option<&Path>)->Option<PathBuf>{
+    if let Some(path)=configured{return ensure_executable(path).ok().map(|_|path.into());}
+    // An explicitly named private instance must not launch an unrelated user's installation.
+    if std::env::var_os("ZSDESK_EVERYTHING_INSTANCE").is_some(){return None;}
     for hive in [HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE]{
         if let Some(path)=registry_path(hive,r"Software\Microsoft\Windows\CurrentVersion\App Paths\Everything.exe",None).filter(|p|p.is_file()){return Some(path);}
         for key in [r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything",r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything 1.5a"]{
@@ -106,7 +108,17 @@ pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
         }
     }
     for variable in ["ProgramFiles","ProgramFiles(x86)"]{if let Some(dir)=std::env::var_os(variable){let path=PathBuf::from(dir).join("Everything/Everything.exe");if path.is_file(){return Some(path);}}}
-    bundle().ok()
+    None
+}
+pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
+    if configured.is_some(){installed_executable(configured)}else{installed_executable(None).or_else(||bundle().ok())}
+}
+/// Read-only availability check; never starts or installs an external engine.
+pub(super) fn available(configured:Option<&Path>)->bool{
+    external(configured).is_some()||match configured{
+        Some(path)=>ensure_executable(path).is_ok(),
+        None=>executable(None).is_some(),
+    }
 }
 pub(super) fn ensure_executable(path:&Path)->Result<()>{ensure!(path.is_absolute()&&path.is_file()&&ordinary_everything(path),"请选择 Everything.exe 程序文件");Ok(())}
 fn expected_hash()->Result<String>{let value:serde_json::Value=serde_json::from_str(MANIFEST)?;value["executable_sha256"].as_str().map(str::to_owned).context("Everything 发布清单缺少内容标识")}
@@ -247,7 +259,8 @@ pub(super) fn ensure_running(configured:Option<&Path>,cancel:&impl Fn()->bool,al
     let root=root()?;let _lock=lock(&root,cancel)?;
     if let Some(connection)=external(configured){return Ok(connection);}
     if let Some(connection)=managed_connection(&root).filter(|connection|configured.is_none_or(|path|same_path(path,&connection.executable))){return Ok(connection);}
-    if let Some(path)=configured{
+    let installed=if configured.is_none(){installed_executable(None)}else{None};
+    if let Some(path)=configured.or(installed.as_deref()){
         ensure_executable(path)?;
         let mut launch=command(path);if let Ok(instance)=std::env::var("ZSDESK_EVERYTHING_INSTANCE"){launch.arg("-instance").arg(instance);}
         launch.arg("-startup").spawn()?;

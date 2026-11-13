@@ -34,6 +34,7 @@ pub struct SearchItem{
 pub struct SearchPage{pub items:Vec<SearchItem>,pub total:u64,pub offset:u32}
 
 pub fn running()->Option<HWND>{runtime::running()}
+pub fn available(configured:Option<&Path>)->bool{runtime::available(configured)}
 pub fn executable(configured:Option<&Path>)->Option<PathBuf>{runtime::executable(configured)}
 pub fn open_settings(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::open_settings(profile)}
 /// Must be invoked only by the explicit “启用全盘索引” user action.

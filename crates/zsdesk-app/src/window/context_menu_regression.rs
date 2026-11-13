@@ -17,6 +17,7 @@ fn pump(ms:u64){let end=Instant::now()+Duration::from_millis(ms);while Instant::
 fn create(root:&Path,folder:&Path,modern:bool)->Result<Runner>{
     unsafe{InitCommonControlsEx(&INITCOMMONCONTROLSEX{dwSize:size_of::<INITCOMMONCONTROLSEX>()as u32,dwICC:ICC_STANDARD_CLASSES|ICC_BAR_CLASSES|ICC_LISTVIEW_CLASSES})}.ok()?;
     let mut session=storage::default_session();session.tabs=vec![ExplorerTab::new(1,ShellLocation::Path(folder.into()))];session.active_tab=0;session.next_id=2;
+    session.ui.context_menu.mode=if modern{zsdesk_core::model::explorer::ContextMenuMode::Windows11}else{zsdesk_core::model::explorer::ContextMenuMode::Original};
     session.ui.show_preview=false;session.ui.hover_preview=false;session.ui.show_details=false;session.ui.show_tree=false;
     let slot=Box::new(RefCell::new(Some(WindowState::new(session,root.join("profile/explorer-session.json"),None,modern))));
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=windows::core::w!("ZSDesk.Native.QuickMenuRegression");
@@ -42,6 +43,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     let mut rows=Vec::new();
     for modern in [false,true]{
         let runner=create(&root.join(if modern{"modern"}else{"classic"}),&folder,modern)?;
+        let exercised=(||->Result<()>{
         for selected in [false,true]{
             let view={let state=runner.slot.borrow();let browser=state.as_ref().unwrap().browser.as_ref().unwrap();
                 browser.select_all(selected);browser.view_window().context("view HWND")?};
@@ -50,6 +52,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
                 ensure!(status.selected==if selected{3}else{0},"selection/background setup failed");
                 if selected{ensure!(status.selected_bytes==Some(24u64*1024*1024*1024),"large-selection size truncated");}}
             for crash in [true,false]{
+                println!("context regression: modern={modern}, selected={selected}, injected_crash={crash}");
                 let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",if crash{"crash"}else{"dismiss"});
                 let before=zsdesk_windows::shell::menu_diagnostics();
                 let mut bounds=RECT::default();unsafe{GetWindowRect(view,&mut bounds)?;}
@@ -71,7 +74,9 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
                 ensure!(before.presenter_creations==after.presenter_creations&&before.last_public_populate_microseconds==after.last_public_populate_microseconds,
                     "modern/classic menu constructed extension state in the main process");
                 ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool()&&unsafe{IsWindow(Some(view))}.as_bool(),"extension crash closed main view");
-                if crash{ensure!(runner.slot.borrow().as_ref().unwrap().status.contains("右键菜单加载失败"),"crash did not report a retryable failure");}
+                if crash{let guard=runner.slot.borrow();let status=&guard.as_ref().unwrap().status;
+                    ensure!(status.contains("系统扩展菜单异常退出")&&status.contains("0xC0000005")&&status.contains("文件管理窗口可继续使用"),
+                        "crash did not preserve the process failure code and recovery message: {status}");}
                 rows.push(serde_json::json!({"modern_preference":modern,"target":if selected{"selection"}else{"background"},
                     "injected_crash":crash,"child_pid":pid,"parent_survived":true,"dispatch_microseconds":dispatch_microseconds,
                     "main_presenter_or_extension_created":false,"worker_rendering_exercised":false}));
@@ -84,6 +89,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
             ("background-new-folder","new-folder",false),("background-new-text","new-text",false)];
         if modern{cases.push(("modern-background-new-folder","modern-owner-new-folder",false));}
         for (case,probe,command_bar) in cases {
+            println!("context regression: modern={modern}, case={case}");
             let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",probe);
             let before:std::collections::HashSet<_>=fs::read_dir(&folder)?.map(|entry|entry.unwrap().path()).collect();
             {
@@ -120,6 +126,23 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
             }
             rows.push(serde_json::json!({"modern_preference":modern,"target":"filesystem/new","case":case,"probe":probe,"diagnostic":current}));
         }
+        // Every new tab creates another Shell view. Repeat real selection
+        // menus across tab switches and both presentation modes.
+        for cycle in 0..4{
+            unsafe{runner.slot.borrow_mut().as_mut().unwrap().new_tab(ShellLocation::Path(folder.clone()));}
+            let deadline=Instant::now()+Duration::from_secs(12);
+            loop{pump(25);if runner.slot.borrow().as_ref().is_some_and(|s|s.pending.is_none()&&s.browser.as_ref().is_some_and(|b|b.status().items==3)){break;}
+                ensure!(Instant::now()<deadline,"new tab view did not settle");}
+            let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","menu-dismiss");
+            let view={let slot=runner.slot.borrow();let b=slot.as_ref().unwrap().browser.as_ref().unwrap();b.select_all(true);b.view_window().unwrap()};
+            pump(30);unsafe{SendMessageW(view,WM_CONTEXTMENU,Some(WPARAM(view.0 as usize)),Some(LPARAM(-1)));}
+            ensure!(super::context_menu::request_active(runner.hwnd),"new tab context request lost");
+            let deadline=Instant::now()+Duration::from_secs(15);
+            while super::context_menu::request_active(runner.hwnd){pump(10);ensure!(Instant::now()<deadline,"new tab menu stalled");}
+            let diagnostic=crate::context_menu_process::read_recent_diagnostics();let current=&diagnostic["current"];
+            ensure!(current["error"].is_null()&&current["timing"]["menu_open_observation"].is_string(),"new tab menu missing: {current}");
+            rows.push(serde_json::json!({"modern_preference":modern,"target":"new-tab-selection","cycle":cycle,"diagnostic":current}));
+        }
         // A virtual root has no filesystem path; render its actual background
         // menu repeatedly, including after a previous worker has been reused.
         unsafe{runner.slot.borrow_mut().as_mut().unwrap().navigate_to(ShellLocation::ThisPc);}
@@ -145,11 +168,14 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
             else{ensure!(current["timing"]["menu_open_observation"].is_string(),"This PC background never displayed a menu (modern={modern}, cycle={cycle}): {current}");}
             rows.push(serde_json::json!({"modern_preference":modern,"target":"this-pc-background","cycle":cycle,"diagnostic":current}));
         }
+        Ok(())})();
+        if let Err(error)=&exercised{eprintln!("context regression failed before teardown (modern={modern}): {error:#}");}
         drop(runner);pump(30);
         crate::context_menu_process::shutdown_idle_worker();
         let deadline=Instant::now()+Duration::from_secs(5);
         while crate::context_menu_process::pending_workers()>0&&Instant::now()<deadline{pump(10);}
         ensure!(crate::context_menu_process::pending_workers()==0,"context worker remains running");
+        exercised?;
     }
     drop(files);
     Ok(serde_json::json!({"selection_bytes":24u64*1024*1024*1024,"files":records,"routes":rows,
@@ -168,4 +194,34 @@ fn native_main_window_background_and_selection_menu_isolation()->Result<()>{
     let current=unsafe{GetForegroundWindow()};let mut process=0;unsafe{GetWindowThreadProcessId(current,Some(&mut process));}
     let isolated=process!=std::process::id();let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"foreground_unchanged":before==current,"test_did_not_activate":isolated});
     fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"desktop cleanup/focus failed");Ok(())
+}
+
+#[test]
+#[ignore="Blank double-click navigation and folder-search scope in a private desktop"]
+fn native_blank_double_click_and_folder_search_scope()->Result<()>{
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("blank-doubleclick");fs::create_dir_all(&root)?;
+    let name=format!("ZSDesk.BlankClick.{}",std::process::id());let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};ensure!(!desktop.is_null(),"private desktop");
+    let raw=desktop as usize;let target=root.clone();
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach");unsafe{OleInitialize(None)?;}let _apartment=Apartment;
+        let folder=target.join("files");fs::create_dir_all(&folder)?;for name in ["one.txt","two.txt","three.txt"]{fs::write(folder.join(name),b"blank click fixture")?;}
+        let runner=create(&target,&folder,false)?;super::pane_input::native_blank_double_click(&runner.slot,&target,pump)?;
+        use zsdesk_core::model::explorer::NewTabLocation;
+        let fixed=target.join("fixed-tab");fs::create_dir_all(&fixed)?;
+        for (policy,expected) in [(NewTabLocation::CurrentFolder,ShellLocation::Path(folder.clone())),
+            (NewTabLocation::ThisPc,ShellLocation::ThisPc),(NewTabLocation::Folder(fixed.clone()),ShellLocation::Path(fixed))]{
+            {let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();storage::save_new_tab_location(&state.config_path,&policy)?;}
+            let before=runner.slot.borrow().as_ref().unwrap().session.tabs.len();
+            unsafe{SendMessageW(runner.hwnd,WM_COMMAND,Some(WPARAM(Command::NewTab.id()as usize)),Some(LPARAM(0)));}
+            let deadline=Instant::now()+Duration::from_secs(12);
+            loop{pump(20);let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();
+                if state.pending.is_none()&&state.queued.is_none()&&state.current_location()==&expected{
+                    ensure!(state.session.tabs.len()==before+1,"new-tab command did not add exactly one tab");break;}
+                ensure!(Instant::now()<deadline,"new-tab policy did not navigate to {}",expected.address());}
+        }
+        drop(runner);pump(30);Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("blank navigation panicked")).and_then(|result|result);
+    let closed=unsafe{CloseDesktop(desktop)}!=0;
+    let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"blank_double_click_enabled_and_disabled":result.is_ok(),"search_scope_follows_folder":result.is_ok(),"new_tab_this_pc_current_and_fixed_folder":result.is_ok()});
+    fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed,"desktop retained");Ok(())
 }

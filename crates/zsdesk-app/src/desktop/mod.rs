@@ -11,16 +11,40 @@ mod fence;
 mod host;
 mod menu_worker;
 mod return_to_desktop;
+mod drag_placement;
+mod clipboard;
+mod outside_selection;
+mod protocol;
 #[cfg(test)]mod window_message_regression;
 #[cfg(test)]mod context_menu_regression;
 
 /// Reads the existing desktop entry without starting a desktop host.
+fn startup_value(config:&std::path::Path)->String{
+    format!("{}.{}",crate::edition::desktop_startup_value(),&crate::quick_search::control::key(config)[..24])
+}
+fn startup_arguments(value:&str)->Option<Vec<String>>{
+    use windows::Win32::{UI::Shell::CommandLineToArgvW,Foundation::{HLOCAL,LocalFree}};
+    let value:Vec<u16>=value.encode_utf16().chain(Some(0)).collect();let mut count=0;
+    let arguments=unsafe{CommandLineToArgvW(PCWSTR(value.as_ptr()),&mut count)};
+    if arguments.is_null(){return None;}
+    let result=unsafe{std::slice::from_raw_parts(arguments,count.max(0)as usize)}.iter().map(|value|unsafe{value.to_string()}).collect::<std::result::Result<Vec<_>,_>>().ok();
+    let _=unsafe{LocalFree(Some(HLOCAL(arguments.cast())))};result
+}
+fn stale_startup_for_profile(current:&str,expected:&str)->bool{
+    let Some(old)=startup_arguments(current)else{return false;};let Some(new)=startup_arguments(expected)else{return false;};
+    if old.len()!=4||new.len()!=4||old[1]!="--desktop"||old[2]!="--profile-dir"||new[1..3]!=old[1..3]{return false;}
+    let old_exe=std::path::Path::new(&old[0]);let new_exe=std::path::Path::new(&new[0]);
+    old_exe.is_absolute()&&old_exe.file_name().zip(new_exe.file_name()).is_some_and(|(a,b)|a.eq_ignore_ascii_case(b))
+        &&crate::explorer_forwarder::same_path(std::path::Path::new(&old[3]),std::path::Path::new(&new[3]))
+        &&old_exe.try_exists().is_ok_and(|exists|!exists)
+}
 pub fn startup_enabled(config: &std::path::Path) -> anyhow::Result<bool> {
     let executable = std::env::current_exe()?;
     let expected = host::fence_startup_command(&executable, config)
         .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
-    Ok(zsdesk_windows::desktop::autostart_command(crate::edition::desktop_startup_value())?
-        .as_deref().is_some_and(|current| zsdesk_windows::desktop::autostart_owned(current, &expected)))
+    for name in [startup_value(config),crate::edition::desktop_startup_value().into()]{
+        if zsdesk_windows::desktop::autostart_command(&name)?.as_deref().is_some_and(|current|zsdesk_windows::desktop::autostart_owned(current,&expected)){return Ok(true);}
+    }Ok(false)
 }
 
 /// Applies the same ownership checks as the desktop tray's login switch.
@@ -29,7 +53,23 @@ pub fn set_startup_enabled(config: &std::path::Path, enabled: bool) -> anyhow::R
     let executable = std::env::current_exe()?;
     let expected = host::fence_startup_command(&executable, config)
         .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
-    zsdesk_windows::desktop::set_autostart(crate::edition::desktop_startup_value(), &expected, enabled)?;
+    let name=startup_value(config);let legacy_name=crate::edition::desktop_startup_value();
+    let legacy=zsdesk_windows::desktop::autostart_command(legacy_name)?;
+    let current=zsdesk_windows::desktop::autostart_command(&name)?;
+    let stale=current.as_ref().filter(|current|stale_startup_for_profile(current,&expected));
+    if let Some(current)=stale{
+        zsdesk_windows::desktop::set_autostart(&name,current,false)?;
+    }
+    if let Err(error)=zsdesk_windows::desktop::set_autostart(&name, &expected, enabled){
+        if let Some(previous)=stale{if zsdesk_windows::desktop::autostart_command(&name)?.is_none(){let _=zsdesk_windows::desktop::set_autostart(&name,previous,true);}}
+        return Err(error.into());
+    }
+    if let Some(legacy)=legacy.filter(|legacy|zsdesk_windows::desktop::autostart_owned(legacy,&expected)||stale_startup_for_profile(legacy,&expected)){
+        // Enabling has succeeded before retiring a demonstrably stale entry.
+        // set_autostart rechecks the exact value; unrelated installs survive.
+        zsdesk_windows::desktop::set_autostart(legacy_name,&legacy,false)?;
+    }
+    anyhow::ensure!(startup_enabled(config)?==enabled,"桌面格子登录启动未能确认保存");
     Ok(())
 }
 
@@ -37,6 +77,10 @@ pub fn set_startup_enabled(config: &std::path::Path, enabled: bool) -> anyhow::R
 pub fn uninstall_owned_startup(config: &std::path::Path, executable: &std::path::Path) -> anyhow::Result<()> {
     let Some(expected) = host::fence_startup_command(executable, config) else { return Ok(()); };
     let value = crate::edition::desktop_startup_value();
+    let scoped=startup_value(config);
+    if zsdesk_windows::desktop::autostart_command(&scoped)?.as_deref().is_some_and(|current|zsdesk_windows::desktop::autostart_owned(current,&expected)){
+        zsdesk_windows::desktop::set_autostart(&scoped,&expected,false)?;
+    }
     if zsdesk_windows::desktop::autostart_command(value)?.as_deref()
         .is_some_and(|current| zsdesk_windows::desktop::autostart_owned(current, &expected)) {
         zsdesk_windows::desktop::set_autostart(value, &expected, false)?;
@@ -44,6 +88,23 @@ pub fn uninstall_owned_startup(config: &std::path::Path, executable: &std::path:
     Ok(())
 }
 pub(crate) mod migration;
+#[cfg(test)]mod startup_tests{
+    use super::*;
+    #[test]fn desktop_startup_migration_only_accepts_same_profile_missing_program(){
+        let root=std::env::temp_dir().join(format!("zsdesk-startup-{}",std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();let old=root.join("old").join("ZSDesk.exe");let current=root.join("new").join("ZSDesk.exe");
+        let config=root.join("profile").join("desktop-fences.json");
+        let expected=host::fence_startup_command(&current,&config).unwrap();let before=host::fence_startup_command(&old,&config).unwrap();
+        assert!(stale_startup_for_profile(&before,&expected));
+        assert!(!stale_startup_for_profile(&format!("{before} --unexpected"),&expected));
+        assert!(!stale_startup_for_profile(&host::fence_startup_command(&old,&root.join("other/desktop-fences.json")).unwrap(),&expected));
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();std::fs::write(&old,b"owned test marker").unwrap();
+        assert!(!stale_startup_for_profile(&before,&expected),"another existing installation must survive");
+        assert_ne!(startup_value(&config),crate::edition::desktop_startup_value());
+        assert_ne!(startup_value(&config),startup_value(&root.join("other/desktop-fences.json")));
+        std::fs::remove_file(&old).unwrap();std::fs::remove_dir(old.parent().unwrap()).unwrap();std::fs::remove_dir(root).unwrap();
+    }
+}
 mod tencent_import;
 
 /// Shell extension calls still retiring after the bounded desktop shutdown.
@@ -83,14 +144,14 @@ use host::{After, DesktopHost, TIMER_AUTOSCROLL, TIMER_DESKTOP, TIMER_FOLDER, TI
 
 const HOST_CLASS: &str = "ZSDesk.Native.DesktopHost";
 const DESKTOP_MAGIC: usize = 0x5A53_4443;
-const WM_COMMAND_REQUEST: u32 = WM_APP + 20;
-const WM_RENAME_REQUEST: u32 = WM_APP + 21;
-const WM_FOREGROUND: u32 = WM_APP + 22;
-const WM_REPAIR_LAYER: u32 = WM_APP + 23;
-const TIMER_RAISE: usize = 9;
-const TIMER_REPAIR_LAYER: usize = 10;
-const TIMER_FOREGROUND: usize = 11;
-const TIMER_CANCEL_INTERACTION:usize=6;
+const WM_COMMAND_REQUEST: u32 = protocol::Message::CommandRequest as u32;
+const WM_RENAME_REQUEST: u32 = protocol::Message::RenameRequest as u32;
+const WM_FOREGROUND: u32 = protocol::Message::Foreground as u32;
+const WM_REPAIR_LAYER: u32 = protocol::Message::RepairLayer as u32;
+const TIMER_RAISE: usize = protocol::HostTimer::Raise as usize;
+const TIMER_REPAIR_LAYER: usize = protocol::HostTimer::RepairLayer as usize;
+const TIMER_FOREGROUND: usize = protocol::HostTimer::Foreground as usize;
+const TIMER_CANCEL_INTERACTION:usize=protocol::FenceTimer::CancelInteraction as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DesktopClick { root: isize, time: u32, x: i32, y: i32 }
@@ -108,8 +169,19 @@ thread_local! {
     static ALLOW_Z: Cell<bool> = const { Cell::new(false) };
     static LAYER_EVENTS: RefCell<std::collections::VecDeque<(u64, HWND, u32, u32)>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static NEXT_LAYER_EVENT: Cell<u64> = const { Cell::new(1) };
+    static LAYER_SETTLE_UNTIL: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     static MENU_WORKER: RefCell<Option<menu_worker::Worker>> = const { RefCell::new(None) };
     static DEFERRED_QUIT: Cell<bool> = const { Cell::new(false) };
+    static SELECTION_INPUT_GENERATION:Cell<u64>=const{Cell::new(1)};
+    static DOUBLE_CLICK_ENABLED:Cell<bool>=const{Cell::new(false)};
+}
+
+fn selection_input_generation()->u64{SELECTION_INPUT_GENERATION.with(Cell::get)}
+fn note_selection_input(hwnd:HWND,message:u32){
+    if matches!(message,WM_KEYDOWN|WM_SYSKEYDOWN|WM_LBUTTONDOWN|WM_LBUTTONDBLCLK|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_NCLBUTTONDOWN|WM_NCRBUTTONDOWN|WM_NCMBUTTONDOWN|WM_NCXBUTTONDOWN|WM_POINTERDOWN|WM_TOUCH){
+        SELECTION_INPUT_GENERATION.with(|generation|generation.set(generation.get().wrapping_add(1).max(1)));
+        zsdesk_windows::shell::file_transfer::note_user_input(hwnd);
+    }
 }
 
 fn queue_foreground(host: HWND, window: HWND) {
@@ -152,6 +224,10 @@ fn request_layer_repair() {
     let host = HOST_HWND.with(Cell::get);
     if host != 0 { let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_REPAIR_LAYER, WPARAM(0), LPARAM(0)) }; }
 }
+fn settle_layer(host:HWND){
+    LAYER_SETTLE_UNTIL.with(|until|until.set(Some(std::time::Instant::now()+std::time::Duration::from_millis(800))));
+    unsafe{SetTimer(Some(host),TIMER_REPAIR_LAYER,100,None);}
+}
 pub(super) fn schedule_desktop_raise(host:HWND){unsafe{SetTimer(Some(host),TIMER_RAISE,180,None);}}
 
 struct MenuLayerRepair;
@@ -162,6 +238,11 @@ impl Drop for MenuLayerRepair { fn drop(&mut self) { request_layer_repair(); } }
 unsafe extern "system" fn foreground_hook(_: windows::Win32::UI::Accessibility::HWINEVENTHOOK, _: u32, hwnd: HWND, _: i32, _: i32, _: u32, _: u32) {
     let host = HOST_HWND.with(Cell::get);
     let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_FOREGROUND, WPARAM(0), LPARAM(hwnd.0 as isize)) };
+}
+unsafe extern "system" fn layer_window_hook(_:windows::Win32::UI::Accessibility::HWINEVENTHOOK,_:u32,hwnd:HWND,object:i32,child:i32,_:u32,_:u32){
+    if object!=0||child!=0||hwnd.0.is_null()||unsafe{GetAncestor(hwnd,GA_ROOT)}!=hwnd{return;}
+    if matches!(class_name(hwnd).as_str(),host::FENCE_CLASS|HOST_CLASS){return;}
+    let host=HOST_HWND.with(Cell::get);if host!=0{let _=unsafe{PostMessageW(Some(HWND(host as*mut _)),WM_REPAIR_LAYER,WPARAM(1),LPARAM(hwnd.0 as isize))};}
 }
 
 /// Runs `f` on the host unless it is already borrowed by an outer call.
@@ -230,19 +311,25 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     let gfx = Gfx::new(&family).context("Direct2D 初始化失败")?;
     zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
-    let hook = config.settings.double_click_toggle;
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
     with_host(|h| h.start());
-    update_hook(hook);
+    let _clipboard=clipboard::Listener::new(hwnd).ok();
+    with_host(|host|update_hook(host.config.settings.double_click_toggle,host.config.settings.organize));
     let foreground = unsafe { windows::Win32::UI::Accessibility::SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
         Some(foreground_hook), 0, 0, WINEVENT_OUTOFCONTEXT) };
+    let layer_hooks=[(EVENT_OBJECT_SHOW,EVENT_OBJECT_HIDE),(EVENT_OBJECT_REORDER,EVENT_OBJECT_REORDER),
+        (EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND),(EVENT_OBJECT_CLOAKED,EVENT_OBJECT_UNCLOAKED)]
+        .map(|(first,last)|unsafe{windows::Win32::UI::Accessibility::SetWinEventHook(first,last,None,Some(layer_window_hook),0,0,WINEVENT_OUTOFCONTEXT)});
     execute(command);
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+        note_selection_input(msg.hwnd,msg.message);
         unsafe { let _ = TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
-    update_hook(false);
+    update_hook(false,false);
     if !foreground.is_invalid() { let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(foreground) }; }
+    for hook in layer_hooks{if !hook.is_invalid(){let _=unsafe{windows::Win32::UI::Accessibility::UnhookWinEvent(hook)};}}
+    LAYER_SETTLE_UNTIL.with(|until|until.set(None));
     if let Some(mut host) = HOST.with(|h| h.borrow_mut().take()) { host.shutdown(); }
     let menu = MENU_WORKER.with(|worker| worker.borrow_mut().take());
     drop(menu);
@@ -317,6 +404,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
 
 // ---- window procedures --------------------------------------------------------
 
+#[deny(unreachable_patterns)]
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let taskbar_created = with_host(|h| h.taskbar_created).unwrap_or(0);
@@ -325,6 +413,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         return LRESULT(0);
     }
     match msg {
+        outside_selection::MESSAGE=>{outside_selection::dispatch();return LRESULT(0);}
+        WM_TIMER if wp.0==outside_selection::TIMER=>{outside_selection::tick();return LRESULT(0);}
+        WM_CANCELMODE=>{outside_selection::cancel();return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};}
         WM_CLOSE => { execute(DesktopCommand::Quit); return LRESULT(0); }
         menu_worker::READY => { finish_menu_work(); return LRESULT(0); }
         WM_COPYDATA if lp.0 != 0 => {
@@ -366,9 +457,16 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_FOREGROUND => { flush_foreground(hwnd); return LRESULT(0); }
+        WM_CLIPBOARDUPDATE => { clipboard::refresh(hwnd);return LRESULT(0); }
+        WM_TIMER if wp.0 == clipboard::TIMER => { clipboard::refresh(hwnd);return LRESULT(0); }
         WM_REPAIR_LAYER | WM_TIMER if msg == WM_REPAIR_LAYER || wp.0 == TIMER_REPAIR_LAYER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_REPAIR_LAYER) };
-            if with_host(|h| h.repair_layer()).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_REPAIR_LAYER, 30, None); } }
+            let event=msg==WM_REPAIR_LAYER&&wp.0==1;
+            if event{settle_layer(hwnd);}
+            let busy=with_host(|h| if event{h.reconcile_layer_event(HWND(lp.0 as*mut _));}else{h.repair_layer();}).is_none();
+            let settling=LAYER_SETTLE_UNTIL.with(|until|until.get().is_some_and(|end|std::time::Instant::now()<end));
+            if busy||settling{unsafe{SetTimer(Some(hwnd),TIMER_REPAIR_LAYER,if busy{30}else{100},None);}}
+            else{LAYER_SETTLE_UNTIL.with(|until|until.set(None));}
             return LRESULT(0);
         }
         WM_TIMER => {
@@ -399,13 +497,14 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let window = HWND(lp.0 as *mut _);
             let class = class_name(window);
             queue_foreground(hwnd,window);
+            settle_layer(hwnd);
             if class == "WorkerW" || class == "Progman" {
                 // "显示桌面" may finish raising its WorkerW after the event: raise again shortly.
                 unsafe { SetTimer(Some(hwnd), TIMER_RAISE, 180, None); }
             }
             return LRESULT(0);
         }
-        WM_DISPLAYCHANGE => { with_host(|h| h.place_all()); return LRESULT(0); }
+        WM_DISPLAYCHANGE => { outside_selection::cancel();with_host(|h| h.place_all()); return LRESULT(0); }
         WM_THEMECHANGED|WM_DWMCOMPOSITIONCHANGED|WM_SYSCOLORCHANGE => {
             with_host(|host|{host.update_palette();for window in &host.fences{fence::apply_glass(window.hwnd);}host.render_all();});return LRESULT(0);
         }
@@ -419,6 +518,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION => { if wp.0 != 0 { with_host(|h| h.shutdown()); } return LRESULT(0); }
         WM_DESTROY => {
+            outside_selection::cancel();
             MENU_WORKER.with(|worker| { if let Some(worker)=worker.borrow().as_ref(){worker.stop();} });
             LAYER_EVENTS.with(|events| events.borrow_mut().clear());
             let _=unsafe { KillTimer(Some(hwnd),TIMER_FOREGROUND) };
@@ -443,7 +543,8 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let id = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u64;
     if id == 0 { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) }; }
-    if msg==zsdesk_windows::shell::file_transfer::result_message(){file_operation_finished(id,hwnd,wp.0 as u32);return LRESULT(0);}
+    note_selection_input(hwnd,msg);
+    if msg==zsdesk_windows::shell::file_transfer::result_message(){file_operation_finished(id,hwnd,wp.0 as u32,lp.0 as usize);return LRESULT(0);}
     match msg {
         WM_MOUSEMOVE => { if let Some(a) = with_host(|h| h.mouse_move(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_ACTIVATE | WM_SETFOCUS | WM_ENTERMENULOOP | WM_EXITMENULOOP => { request_layer_repair(); }
@@ -513,6 +614,8 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_PEEK => { with_host(|h| h.peek_check(id)); return LRESULT(0); }
+        WM_TIMER if wp.0==host::TIMER_NOTICE=>{with_host(|host|host.clear_notice(id));return LRESULT(0);}
+        WM_TIMER if wp.0==host::TIMER_SELECTION=>{with_host(|host|host.poll_completed_selection(id));return LRESULT(0);}
         WM_TIMER if wp.0 == TIMER_AUTOSCROLL => { with_host(|h| h.rubber_autoscroll(id)); return LRESULT(0); }
         WM_TIMER if wp.0 == TIMER_FOLDER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_FOLDER) };
@@ -544,46 +647,30 @@ fn cancel_fence_interaction(hwnd:HWND,id:u64){
 }
 
 fn fence_hwnd(fence: u64) -> Option<HWND> { with_host(|h| h.win_index(fence).map(|i| h.fences[i].hwnd)).flatten() }
+struct FenceModal(u64);
+impl FenceModal{fn begin(fence:u64)->Self{with_host(|host|host.begin_modal(fence));Self(fence)}}
+impl Drop for FenceModal{fn drop(&mut self){with_host(|host|host.end_modal(self.0));}}
 
 fn refresh_fence(fence: u64) {
     with_host(|h| if h.config.fence(fence).is_some_and(|f| f.is_desktop()) { h.refresh_desktop(); } else { h.refresh_folder(fence); });
 }
 
-fn file_operation_finished(fence:u64,owner:HWND,code:u32){
+fn file_operation_finished(fence:u64,owner:HWND,code:u32,token:usize){
     use zsdesk_windows::shell::file_transfer;
+    let Some(completion)=file_transfer::take_completion(owner,token)else{return;};
+    if !completion.origin.as_ref().is_some_and(|origin|with_host(|host|host.operation_current(fence,origin))==Some(true)){return;}
+    let accepted=with_host(|host|host.adopt_completed_paths(fence,&completion.outputs)).unwrap_or_default();
+    refresh_fence(fence);
+    let select=completion.origin.as_ref().is_some_and(file_transfer::origin_current);
+    with_host(|host|{if select{host.select_completed_paths(fence,&accepted,matches!(completion.operation,file_transfer::Operation::NewFolder));}});
     if code!=0{
         file_action_error(owner,&windows::core::Error::from_hresult(windows::core::HRESULT(code as i32)));
-        refresh_fence(fence);return;
     }
-    let created=file_transfer::take_created_folder(owner);
-    if let Some(path)=&created{
-        let name=path.file_name().map(|name|name.to_string_lossy().into_owned()).into_iter().collect();
-        with_host(|host|host.expect_new_items(fence,name));
-    }
-    refresh_fence(fence);
-    let Some(path)=created else{return;};
-    with_host(|host|{
-        if host.target_folder(fence).as_deref()!=path.parent(){return;}
-        let Some(index)=host.win_index(fence)else{return;};
-        let Some(item)=host.fences[index].entries.iter().position(|entry|entry.path.as_ref()==Some(&path))else{return;};
-        let key=host.fences[index].entries[item].key.clone();
-        if let Some(config)=host.config.fence(fence).cloned(){
-            let window=&mut host.fences[index];window.selection.clear();window.selection.insert(key.clone());window.focus=Some(item);window.anchor=Some(item);
-            let geometry=window.geometry(&config);
-            if let Some(cell)=geometry.cells.get(item){
-                if cell.cell.y<geometry.content.y{window.scroll-=(geometry.content.y-cell.cell.y).max(0);}
-                else if cell.cell.bottom()>geometry.content.bottom(){window.scroll+=cell.cell.bottom()-geometry.content.bottom();}
-                window.scroll=window.scroll.clamp(0,geometry.max_scroll);
-            }
-        }
-        host.render(fence);
-        if unsafe{IsWindowVisible(owner)}.as_bool()&&unsafe{GetForegroundWindow()}==owner{host.begin_rename(fence,fence::RenameTarget::Item(key));}
-    });
 }
 
 fn file_action_error(owner: HWND, error: &windows::core::Error) {
-    if matches!(error.code().0 as u32, 0x800704c7 | 0x80004004) || !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
-    let text = wide(&format!("无法完成文件操作：{}（0x{:08X}）", error.message(), error.code().0 as u32));
+    if zsdesk_windows::shell::file_transfer::is_cancelled(error.code()) || !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
+    let text = wide(&format!("无法完成文件操作：{}",zsdesk_windows::shell::file_transfer::error_message(error)));
     unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
 }
 
@@ -597,6 +684,10 @@ fn dispatch_application_menu(fence: u64, owner: HWND, command: u32, ids: &[Strin
 }
 
 fn run_after(after: After) {
+    let hold=match &after{After::ItemMenu{fence,..}|After::FenceMenu{fence,..}|After::FolderSystemMenu{fence,..}|After::Drag{fence}|After::ReturnToDesktop{fence,..}
+        |After::Open{fence,..}|After::Verb{fence,..}|After::History{fence,..}|After::Rename{fence,..}|After::AddTab{fence,..}|After::TabList{fence,..}=>Some(*fence),
+        After::DeleteFence(id)=>Some(*id),After::PickFolder{replace}=>*replace,After::PickFolderTab{to}=>Some(*to),_=>None};
+    let _hold=hold.map(FenceModal::begin);
     match after {
         After::Nothing => {}
         After::ItemMenu { fence, point } => item_menu(fence, point),
@@ -660,13 +751,15 @@ fn quick_fence_menu(mut request:menu_worker::Request){
 }
 
 fn queue_menu(mut request:menu_worker::Request){
+    let fence=request.fence;
+    if matches!(request.target,menu_worker::Target::Background{..})&&request.mode==crate::context_menu_process::Mode::More{request.layout=with_host(|host|host.menu_layout(fence)).flatten();}else{request.layout=None;}
     let owner=HWND(request.owner as*mut _);
     let Some(host)=with_host(|host|host.hwnd)else{return;};
     let _=unsafe{SetForegroundWindow(owner)};
     request.foreground=unsafe{GetForegroundWindow()}.0 as isize;
     let result=MENU_WORKER.with(|worker|->anyhow::Result<()>{
         let mut worker=worker.borrow_mut();if worker.is_none(){*worker=Some(menu_worker::Worker::new(host)?);}
-        worker.as_ref().unwrap().submit(request);Ok(())
+        let generation=worker.as_ref().unwrap().submit(request);with_host(|host|host.menu_started(fence,generation));Ok(())
     });
     if let Err(error)=result{file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
     request_layer_repair();
@@ -690,26 +783,60 @@ fn finish_menu_work(){
     for event in events{match event{
         menu_worker::Event::Validate{request,before_invoke,answer}=>{
             let valid=menu_request_current(request.generation)&&menu_target_current(&request);
-            if valid&&before_invoke&&matches!(request.target,menu_worker::Target::Background{..}){with_host(|host|host.expect_new_items(request.fence,Vec::new()));}
+            let _=before_invoke;
             let _=answer.try_send(valid);
         }
-        menu_worker::Event::Finished{request,ids,outcome,..}=>{
+        menu_worker::Event::Finished{request,ids,outcome,effects,..}=>{
+            with_host(|host|host.menu_finished(request.fence,request.generation));
             let _layer=MenuLayerRepair;
             let owner=HWND(request.owner as*mut _);
             // Shell commands already ran against their captured PIDLs. Only
             // application actions require the current selection to still match.
-            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore));
+            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}));
             // A superseded construction can fail after another menu was
             // requested. Its error must not interrupt the newer interaction.
             if outcome.is_err()&&!menu_request_current(request.generation){continue;}
             if actionable&&(!menu_request_current(request.generation)||!menu_target_current(&request)){continue;}
+            if let Ok(action @ (MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}))=outcome{
+                if let Err(error)=dispatch_menu_file_action(&request,action){file_action_error(owner,&error);}continue;
+            }
+            if menu_request_current(request.generation)&&menu_target_current(&request){
+                if let Some(layout)=effects.layout.as_ref(){with_host(|host|host.apply_menu_layout(request.fence,layout,effects.sort_changed));}
+                let created:Vec<_>=effects.created.iter().map(|item|item.path.clone()).collect();
+                let accepted=with_host(|host|host.adopt_completed_paths(request.fence,&created)).unwrap_or_default();
+                if !accepted.is_empty(){refresh_fence(request.fence);with_host(|host|host.select_completed_paths(request.fence,&accepted,effects.created.len()==1&&effects.created[0].rename));}
+            }
             let target_key=match request.target{menu_worker::Target::Items{key,..}=>key,_=>None};
             finish_menu(request.fence,owner,request.point,target_key,&ids,outcome.map_err(|(code,message)|windows::core::Error::new(windows::core::HRESULT(code),message)));
         }
     }}
 }
 
+fn dispatch_menu_file_action(request:&menu_worker::Request,action:MenuOutcome)->windows::core::Result<()>{
+    use zsdesk_windows::shell::file_transfer;
+    let owner=HWND(request.owner as*mut _);
+    with_host(|host|host.bind_operation(request.fence)).ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))??;
+    let paths=match &request.target{menu_worker::Target::Items{pidls,..}=>file_transfer::paths_from_pidls(pidls)?,_=>Vec::new()};
+    match action{
+        MenuOutcome::Copy|MenuOutcome::Cut=>file_transfer::copy_paths(owner,&paths,action==MenuOutcome::Cut),
+        MenuOutcome::Delete{permanent}=>file_transfer::delete_paths(owner,paths,permanent),
+        MenuOutcome::Paste=>{
+            let destination=match &request.target{
+                menu_worker::Target::Background{folder}=>folder.clone(),
+                menu_worker::Target::Items{pidls,..} if pidls.len()==1=>{
+                    use windows::Win32::System::SystemServices::{SFGAO_FOLDER,SFGAO_STREAM};
+                    let item=zsdesk_windows::shell::pidl::item_from_pidl(&pidls[0])?;
+                    if unsafe{item.GetAttributes(SFGAO_FOLDER|SFGAO_STREAM)}?.0&(SFGAO_FOLDER.0|SFGAO_STREAM.0)==SFGAO_FOLDER.0{paths.first().cloned()}else{None}
+                },_=>None,
+            };
+            if file_transfer::has_filesystem_clipboard(){if let Some(destination)=destination{return file_transfer::paste(owner,&destination);}}
+            let mut delegated=request.clone();delegated.mode=crate::context_menu_process::Mode::Paste;delegated.layout=None;queue_menu(delegated);Ok(())
+        },_=>Ok(()),
+    }
+}
+
 fn finish_menu(fence:u64,hwnd:HWND,point:POINT,target_key:Option<String>,ids:&[String],outcome:windows::core::Result<MenuOutcome>){
+    let _hold=FenceModal::begin(fence);
     match outcome {
         Ok(MenuOutcome::Application(command)) => dispatch_application_menu(fence, hwnd, command, &ids, point),
         Ok(action @ (MenuOutcome::Rename | MenuOutcome::Open | MenuOutcome::Explore)) => {
@@ -727,7 +854,7 @@ fn finish_menu(fence:u64,hwnd:HWND,point:POINT,target_key:Option<String>,ids:&[S
         }
         Ok(MenuOutcome::Dismissed) => {},
         Ok(_) => refresh_fence(fence),
-        Err(error) if matches!(error.code().0 as u32,0x80004004|0x800704c7)=>{},
+        Err(error) if zsdesk_windows::shell::file_transfer::is_cancelled(error.code())=>{},
         Err(error) => { file_action_error(hwnd, &error); refresh_fence(fence); }
     }
 }
@@ -738,6 +865,7 @@ fn fence_menu(fence: u64, point: POINT) {
     // popup separate preserves their string IDs and never mixes them with
     // command numbers rebuilt by Windows' native Shell presenter.
     MENU_WORKER.with(|worker|if let Some(worker)=worker.borrow().as_ref(){worker.cancel_current();});
+    with_host(|host|host.menu_cancelled());
     tab_popup(fence,point,|host|host.fence_menu(fence));
 }
 
@@ -752,6 +880,7 @@ fn folder_system_menu(fence:u64,point:POINT){
 
 /// Small ZSUI menus anchored under a title-bar button ("+", "⌄ N").
 fn tab_popup(fence: u64, point: POINT, spec: impl FnOnce(&DesktopHost) -> MenuSpec) {
+    let _hold=FenceModal::begin(fence);
     let _layer = MenuLayerRepair;
     let Some((hwnd, spec)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, spec(h)))).flatten() else { return };
     let _ = unsafe { SetForegroundWindow(hwnd) };
@@ -820,16 +949,17 @@ fn apply_context_preferences() {
 }
 
 fn drag(fence: u64) {
+    let _hold=FenceModal::begin(fence);
     let Some((hwnd, owner, pidls, keys, entries)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.hwnd, h.selected_pidls(fence), h.selected_keys(fence),
         h.selected_entries_owned(fence)))).flatten() else { return };
     if pidls.is_empty() { return; }
     let Ok(data) = desktop::data_object(hwnd, &pidls) else { return };
-    with_host(|h| h.internal_drag = Some((fence, keys)));
+    with_host(|h| h.begin_internal_drag(fence,keys,&data));
     let surfaces = return_to_desktop::DesktopDropSurfaces::new(owner, fence, &data, entries);
     let result = unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };
     let returned = surfaces.completed();
     drop(surfaces);
-    with_host(|h| h.internal_drag = None);
+    with_host(|h| h.end_internal_drag());
     if let Err(error) = result { file_action_error(owner, &error); }
     with_host(|host| { host.sync_windows(); if returned { host.repair_layer(); } });
     refresh_fence(fence);
@@ -879,8 +1009,20 @@ fn run_history(fence: u64, action: HistoryAction) {
 fn run_verb(fence: u64, verb: &'static str, background: bool) {
     let Some(hwnd) = fence_hwnd(fence) else { return };
     let shift = key_down(VK_SHIFT);
+    if background&&verb=="paste"&&!zsdesk_windows::shell::file_transfer::has_filesystem_clipboard(){
+        if let Some((folder,profile))=with_host(|host|(host.target_folder(fence),host.explorer_config.clone())){
+            let mut point=POINT::default();let _=unsafe{GetCursorPos(&mut point)};
+            let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),menu_worker::Target::Background{folder},false);
+            request.mode=crate::context_menu_process::Mode::Paste;queue_menu(request);
+        }return;
+    }
     let result = (|| -> windows::core::Result<()> {
         use zsdesk_windows::shell::file_transfer;
+        with_host(|host|host.bind_operation(fence)).ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))??;
+        if background&&verb.eq_ignore_ascii_case("NewFolder"){
+            let folder=with_host(|host|host.target_folder(fence)).flatten().ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))?;
+            return file_transfer::new_folder(hwnd,&folder);
+        }
         if background&&verb=="paste"{
             let folder=with_host(|host|host.target_folder(fence)).flatten().ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))?;
             with_host(|host|host.expect_new_items(fence,Vec::new()));
@@ -955,6 +1097,31 @@ fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
 // ---- drag and drop target ---------------------------------------------------------
 
 pub struct FenceDrop { pub fence: u64 }
+fn drop_effects(moving:bool,success:bool)->(DROPEFFECT,DROPEFFECT,DROPEFFECT){
+    if !success{return(DROPEFFECT_NONE,DROPEFFECT_NONE,DROPEFFECT_NONE);}
+    if moving{(DROPEFFECT_NONE,DROPEFFECT_NONE,DROPEFFECT_MOVE)}else{(DROPEFFECT_COPY,DROPEFFECT_COPY,DROPEFFECT_COPY)}
+}
+#[cfg(test)]mod drop_protocol_tests{
+    use super::*;
+    #[test]fn physical_move_never_requests_source_deletion_again(){
+        assert_eq!(drop_effects(true,true),(DROPEFFECT_NONE,DROPEFFECT_NONE,DROPEFFECT_MOVE));
+        assert_eq!(drop_effects(false,true),(DROPEFFECT_COPY,DROPEFFECT_COPY,DROPEFFECT_COPY));
+        assert_eq!(drop_effects(true,false),(DROPEFFECT_NONE,DROPEFFECT_NONE,DROPEFFECT_NONE));
+        assert_eq!(drop_effects(false,false),(DROPEFFECT_NONE,DROPEFFECT_NONE,DROPEFFECT_NONE));
+    }
+}
+fn publish_drop_effect(data:&IDataObject,name:PCWSTR,effect:DROPEFFECT)->windows::core::Result<()>{
+    use windows::Win32::{Foundation::GlobalFree,System::{Com::{FORMATETC,STGMEDIUM,STGMEDIUM_0,TYMED_HGLOBAL,DVASPECT_CONTENT},DataExchange::RegisterClipboardFormatW,
+        Memory::{GlobalAlloc,GlobalLock,GlobalUnlock,GMEM_MOVEABLE}}};
+    let format=unsafe{RegisterClipboardFormatW(name)};if format==0{return Err(windows::core::Error::from_thread());}
+    let memory=unsafe{GlobalAlloc(GMEM_MOVEABLE,4)}?;let pointer=unsafe{GlobalLock(memory)};
+    if pointer.is_null(){let error=windows::core::Error::from_thread();let _=unsafe{GlobalFree(Some(memory))};return Err(error);}
+    unsafe{pointer.cast::<u32>().write(effect.0);let _=GlobalUnlock(memory);}
+    let format=FORMATETC{cfFormat:format as u16,dwAspect:DVASPECT_CONTENT.0,lindex:-1,tymed:TYMED_HGLOBAL.0 as u32,..Default::default()};
+    let medium=STGMEDIUM{tymed:TYMED_HGLOBAL.0 as u32,u:STGMEDIUM_0{hGlobal:memory},pUnkForRelease:std::mem::ManuallyDrop::new(None)};
+    let result=unsafe{data.SetData(&format,&medium,true)};
+    if result.is_err(){let _=unsafe{GlobalFree(Some(memory))};}result
+}
 
 impl DropHandler for FenceDrop {
     fn enter(&self, data: &IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
@@ -965,12 +1132,30 @@ impl DropHandler for FenceDrop {
     }
     fn leave(&self) { with_host(|h| h.drag_leave(self.fence)); }
     fn dropped(&self, data: &IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
-        let target = with_host(|h| h.take_drop(self.fence, data, point)).flatten();
+        let _hold=FenceModal::begin(self.fence);
+        let target = with_host(|h| h.take_drop(self.fence, data, keys,point,allowed)).unwrap_or(host::PreparedDrop::Rejected);
         let mut effect = allowed;
         match target {
             // The Shell target runs the copy/move (with its progress UI) outside the host borrow.
-            Some(target) => if unsafe { target.Drop(data, MODIFIERKEYS_FLAGS(keys), POINTL { x: point.x, y: point.y }, &mut effect) }.is_err() { effect = DROPEFFECT_NONE; },
-            None => effect = DROPEFFECT_NONE,
+            host::PreparedDrop::Shell(target) => if unsafe { target.Drop(data, MODIFIERKEYS_FLAGS(keys), POINTL { x: point.x, y: point.y }, &mut effect) }.is_err() { effect = DROPEFFECT_NONE; },
+            host::PreparedDrop::FileSystem{owner,fence,paths,destination,moving}=>{
+                match zsdesk_windows::shell::file_transfer::transfer_drop(owner,paths,destination,moving){
+                    Ok(completion)=>{
+                        if completion.origin.as_ref().is_some_and(|origin|with_host(|host|host.operation_current(fence,origin))==Some(true)){
+                            let accepted=with_host(|host|host.adopt_completed_paths(fence,&completion.outputs)).unwrap_or_default();refresh_fence(fence);
+                            let select=completion.origin.as_ref().is_some_and(zsdesk_windows::shell::file_transfer::origin_current);
+                            with_host(|host|{if select{host.select_completed_paths(fence,&accepted,false);}});
+                        }
+                        if let Some(error)=completion.error{file_action_error(owner,&windows::core::Error::from_hresult(error));}
+                        let(returned,performed,logical)=drop_effects(moving,!completion.aborted&&completion.error.is_none()&&completion.completed==completion.requested);
+                        let _=publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_PERFORMEDDROPEFFECT,performed);
+                        let _=publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_LOGICALPERFORMEDDROPEFFECT,logical);effect=returned;
+                    },
+                    Err(error)=>{file_action_error(owner,&error);effect=DROPEFFECT_NONE;}
+                }
+            },
+            host::PreparedDrop::Assigned=>effect=DROPEFFECT_MOVE,
+            host::PreparedDrop::Rejected => effect = DROPEFFECT_NONE,
         }
         refresh_fence(self.fence);
         effect
@@ -979,7 +1164,10 @@ impl DropHandler for FenceDrop {
 
 // ---- desktop double-click hook ------------------------------------------------------
 
-pub fn update_hook(enabled: bool) {
+pub fn update_hook(double_click: bool, organize:bool) {
+    DOUBLE_CLICK_ENABLED.with(|slot|slot.set(double_click));
+    outside_selection::configure(organize);
+    let enabled=double_click||organize;
     LAST_CLICK.with(|click| click.set(None));
     let current = HOOK.with(Cell::get);
     if enabled && current == 0 {
@@ -1013,12 +1201,14 @@ fn pack_screen_point(point: POINT) -> isize { ((u64::from(point.y as u32) << 32)
 fn unpack_screen_point(value: isize) -> POINT { POINT { x: value as u32 as i32, y: ((value as u64) >> 32) as u32 as i32 } }
 
 unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code >= 0 && wp.0 as u32 == WM_LBUTTONDOWN && lp.0 != 0 {
+    let mut double=false;
+    if code >= 0 && wp.0 as u32 == WM_LBUTTONDOWN && lp.0 != 0 && DOUBLE_CLICK_ENABLED.with(Cell::get) {
         let info = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
         let limit = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
         let (dx, dy) = (unsafe { GetSystemMetrics(SM_CXDOUBLECLK) }, unsafe { GetSystemMetrics(SM_CYDOUBLECLK) });
         let current = desktop_click_root(info.pt).map(|root| DesktopClick { root: root.0 as isize, time: info.time, x: info.pt.x, y: info.pt.y });
-        let (next, double) = next_desktop_click(LAST_CLICK.with(Cell::get), current, limit, dx, dy);
+        let (next, found_double) = next_desktop_click(LAST_CLICK.with(Cell::get), current, limit, dx, dy);
+        double=found_double;
         LAST_CLICK.with(|click| click.set(next));
         if double {
             let host = HOST_HWND.with(Cell::get);
@@ -1029,6 +1219,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     } else if code >= 0 && matches!(wp.0 as u32, WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
         LAST_CLICK.with(|click| click.set(None));
     }
+    if code>=0&&lp.0!=0{let info=unsafe{&*(lp.0 as*const MSLLHOOKSTRUCT)};outside_selection::observe(wp.0 as u32,info.pt,double);}
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
