@@ -707,7 +707,7 @@ impl DesktopHost {
         for f in &self.fences {
             if self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
             let _ = unsafe { ShowWindow(f.hwnd, SW_SHOWNOACTIVATE) };
-            if f.peek { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
+            if f.peek || f.raised_on_expand { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
         self.schedule_save();
         self.render_all();
@@ -720,7 +720,7 @@ impl DesktopHost {
             if f.standalone { continue; }
             if !self.config.settings.hidden && self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
             let _ = unsafe { ShowWindow(f.hwnd, show) };
-            if !self.config.settings.hidden && f.peek { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
+            if !self.config.settings.hidden && (f.peek || f.raised_on_expand) { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
         if self.config.settings.hidden { self.release_hidden_graphics(); }
         self.render_all();
@@ -775,6 +775,7 @@ impl DesktopHost {
             let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
             if !fence.is_hidden_tab() && !shown {
                 self.fences[i].peek = false;
+                self.fences[i].raised_on_expand = false;
                 let (r,up)=screen_frame(&fence.placement,fence.collapsed,self.fences[i].standalone);self.fences[i].title_bottom=up;
                 let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
                 self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
@@ -785,6 +786,7 @@ impl DesktopHost {
                 let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
                 let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) };
                 win.peek = false;
+                win.raised_on_expand = false;
                 win.surface = None;
                 win.hover = FenceHit::None;
             }
@@ -929,6 +931,7 @@ impl DesktopHost {
             let (r,up)=screen_frame(&fence.placement,fence.collapsed,false);self.fences[i].title_bottom=up;
             let hwnd = self.fences[i].hwnd;
             self.fences[i].peek = false;
+                self.fences[i].raised_on_expand = false;
             let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
             if let Some(target) = target_hwnd { super::set_z(hwnd, target); }
         }
@@ -1045,7 +1048,7 @@ impl DesktopHost {
             after = unsafe { GetWindow(after, GW_HWNDPREV) }.unwrap_or_default();
         }
         let after = if after.0.is_null() { HWND_TOP } else { after };
-        for fence in &self.fences { super::set_z(fence.hwnd, after); }
+        for fence in self.fences.iter().filter(|f| !f.peek && !f.raised_on_expand) { super::set_z(fence.hwnd, after); }
     }
 
     pub fn lower_all(&mut self, foreground: HWND) {
@@ -1113,7 +1116,7 @@ impl DesktopHost {
         }
         if after.is_none(){if let Some(anchor)=anchor{self.place_above_desktop(anchor.hwnd);return;}}
         let after=after.unwrap_or(HWND_BOTTOM);
-        for fence in &self.fences { super::set_z(fence.hwnd, after); }
+        for fence in self.fences.iter().filter(|f| !f.peek && !f.raised_on_expand) { super::set_z(fence.hwnd, after); }
     }
 
     /// Owner activation and popup menus can reorder Progman's owned windows
@@ -1201,7 +1204,17 @@ impl DesktopHost {
         });
         self.fences[index] = win;
         self.prune_icon_cache();
+        if presented {unsafe {SetTimer(Some(self.hwnd),super::protocol::HostTimer::PaintIdle as usize,zsdesk_windows::gfx::PAINT_IDLE_MS,None);}}
         presented
+    }
+
+    pub(super) fn release_idle_graphics(&mut self) {
+        // UpdateLayeredWindow copies each completed frame; the compositor keeps
+        // it visible after these application-owned staging surfaces are released.
+        for window in &mut self.fences {window.surface=None;}
+        for slot in self.icons.values_mut(){slot.bitmap=None;}
+        self.gfx.release_device_resources();
+        zsdesk_windows::gfx::reclaim_unused_heap_pages();
     }
 
     pub fn icons_ready(&mut self) {
@@ -1778,6 +1791,7 @@ impl DesktopHost {
         win.peek=open;win.title_bottom=up;
         let hwnd=win.hwnd;
         let _=unsafe{SetWindowPos(hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE)};
+        if open { super::set_z(hwnd, HWND_TOP); } else { self.repair_layer(); }
         // Poll instead of WM_MOUSELEAVE so menus and drags keep the fence open.
         if open { unsafe { SetTimer(Some(hwnd), TIMER_PEEK, 250, None); } } else { let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) }; }
         self.render(id);
@@ -1787,7 +1801,7 @@ impl DesktopHost {
     pub fn peek_check(&mut self, id: u64) {
         let Some(index) = self.win_index(id) else { return };
         let win = &self.fences[index];
-        if !win.peek { let _ = unsafe { KillTimer(Some(win.hwnd), TIMER_PEEK) }; return; }
+        if !win.peek && !win.raised_on_expand { let _ = unsafe { KillTimer(Some(win.hwnd), TIMER_PEEK) }; return; }
         if self.interaction_holds_open(id)||win.interaction.is_some() || win.rename.is_some() || win.drop_hover.is_some()||win.notice.as_ref().is_some_and(|(_,until)|Instant::now()<*until) { return; }
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&mut cursor) }.is_err(){return;}
@@ -1800,10 +1814,15 @@ impl DesktopHost {
     }
     fn peek_check_observed(&mut self,id:u64,cursor:POINT,menu_open:bool){
         let Some(index)=self.win_index(id)else{return;};let win=&self.fences[index];
-        if !win.peek||self.interaction_holds_open(id)||win.interaction.is_some()||win.rename.is_some()||win.drop_hover.is_some()
+        if (!win.peek && !win.raised_on_expand)||self.interaction_holds_open(id)||win.interaction.is_some()||win.rename.is_some()||win.drop_hover.is_some()
             ||win.notice.as_ref().is_some_and(|(_,until)|Instant::now()<*until){return;}
         let r=win.window_rect();let inside=cursor.x>=r.left&&cursor.x<r.right&&cursor.y>=r.top&&cursor.y<r.bottom;
-        if (!inside||!self.config.settings.hover_expand)&&!menu_open{self.peek(id,false);}
+        if !menu_open && win.raised_on_expand && !inside {
+            self.fences[index].raised_on_expand=false;
+            self.repair_layer();
+        } else if !menu_open && win.peek && (!inside||!self.config.settings.hover_expand) {
+            self.peek(id,false);
+        }
     }
     pub(super) fn begin_modal(&mut self,id:u64){*self.modal_holds.entry(id).or_default()+=1;}
     pub(super) fn end_modal(&mut self,id:u64){if let Some(count)=self.modal_holds.get_mut(&id){*count=count.saturating_sub(1);if *count==0{self.modal_holds.remove(&id);}}}
@@ -2165,6 +2184,14 @@ impl DesktopHost {
         if let Some(index) = self.win_index(id) {
             let (rect,up)=screen_frame(&placement,collapsed,false);self.fences[index].title_bottom=up;
             let _=unsafe{SetWindowPos(self.fences[index].hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE)};
+        }
+        if let Some(index) = self.win_index(id) {
+            self.fences[index].raised_on_expand = !collapsed;
+            let hwnd=self.fences[index].hwnd;
+            if collapsed { self.repair_layer(); } else {
+                super::set_z(hwnd, HWND_TOP);
+                unsafe { SetTimer(Some(hwnd), TIMER_PEEK, 250, None); }
+            }
         }
         self.schedule_save();
         self.render(id);

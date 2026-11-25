@@ -135,6 +135,14 @@ pub struct ExplorerBrowserHost {
 }
 
 impl ExplorerBrowserHost {
+    /// Select the Shell renderer with a standard list control before browsing.
+    pub fn use_list_renderer(&self, enabled:bool) {
+        use windows::Win32::UI::Shell::{IFolderViewOptions, FOLDERVIEWOPTIONS, FVO_VISTALAYOUT};
+        if let Ok(options) = self.browser.cast::<IFolderViewOptions>() {
+            let value = if enabled { FVO_VISTALAYOUT } else { FOLDERVIEWOPTIONS(0) };
+            let _ = unsafe { options.SetFolderViewOptions(FVO_VISTALAYOUT, value) };
+        }
+    }
     pub fn set_picker(&self,pattern:&str,multiple:bool,folders_only:bool){
         *self.picker.borrow_mut()=Some((pattern.to_owned(),multiple,folders_only));
         if let Ok(view)=unsafe{self.browser.GetCurrentView::<IShellView>()}{apply_picker_flags(&view,&self.picker);}

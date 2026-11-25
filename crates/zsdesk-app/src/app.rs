@@ -86,7 +86,12 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         if arg == "--apply-import" { opts.apply_import = true; continue; }
         if arg == "--classic-menu" { opts.classic = true; continue; }
         if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context(zsdesk_core::i18n::text("缺少配置目录"))?)); continue; }
-        if arg == "--select" { opts.select = true; continue; }
+        if let Some(value) = arg.to_str().and_then(|s| s.get(..8).filter(|v| v.eq_ignore_ascii_case("/select,")).map(|_| &s[8..])) {
+            opts.select = true;
+            if !value.is_empty() && opts.target.replace(value.into()).is_some() { bail!("只能指定一个定位目标"); }
+            continue;
+        }
+        if arg == "--select" || arg.eq_ignore_ascii_case("/select") { opts.select = true; continue; }
         // Registered by system integration: behaves like a plain path argument.
         if arg == "--shell-open" {opts.shell_open=true; continue; }
         if arg == "--desktop" { if matches!(opts.mode, Mode::ImportTencent | Mode::QuickSearch(_)) { bail!("不能混用桌面和其他启动模式"); } if opts.mode == Mode::Explorer { opts.mode = Mode::Desktop(DesktopCommand::Show); } continue; }
@@ -452,6 +457,12 @@ mod tests {
     }
     #[test]
     fn selection_requires_target_and_keeps_unicode_names() {
+        let path = r"C:\微信文件\接收, 甲.pdf";
+        for args in [vec![format!("/select,{path}")], vec!["/SELECT,".into(),path.into()]] {
+            let options = parse(args.into_iter().map(OsString::from)).unwrap();
+            assert!(options.select);
+            assert_eq!(options.target.as_deref(),Some(std::ffi::OsStr::new(path)));
+        }
         assert!(parse([OsString::from("--select")]).is_err());
         let opts = parse(["--select", "--classic-menu", r"C:\工作 文件\图纸.pdf"].map(OsString::from)).unwrap();
         assert!(opts.select && opts.classic);

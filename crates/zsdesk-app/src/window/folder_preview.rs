@@ -1,12 +1,8 @@
 use std::path::Path;
-use windows::{
-    core::w,
-    Win32::{
+use windows::Win32::{
         Foundation::{COLORREF, HWND, LPARAM, WPARAM},
         Graphics::Gdi::HFONT,
-        Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
-        UI::{Controls::*, Shell::*, WindowsAndMessaging::*},
-    },
+        UI::{Controls::*, WindowsAndMessaging::*},
 };
 
 pub(super) fn create(
@@ -57,51 +53,16 @@ pub(super) fn create(
             Some(LPARAM(0)),
         );
     }
-    let mut icons = [-1i32; 2];
-    for (i, attrs) in [FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_DIRECTORY]
-        .into_iter()
-        .enumerate()
-    {
-        let mut info = SHFILEINFOW::default();
-        let images = unsafe {
-            SHGetFileInfoW(
-                w!("entry"),
-                attrs,
-                Some(&mut info),
-                std::mem::size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
-            )
-        };
-        if images != 0 {
-            icons[i] = info.iIcon;
-            unsafe {
-                SendMessageW(
-                    list,
-                    LVM_SETIMAGELIST,
-                    Some(WPARAM(LVSIL_SMALL as usize)),
-                    Some(LPARAM(images as isize)),
-                );
-            }
-        }
-    }
+    let mut attached = 0;
     for (row, entry) in items.iter().enumerate() {
         crate::report_list::cell(list, row, 0, &entry.name.to_string_lossy());
-        let image = icons[entry.folder as usize];
-        if image >= 0 {
-            let item = LVITEMW {
-                mask: LVIF_IMAGE,
-                iItem: row as i32,
-                iImage: image,
-                ..Default::default()
-            };
-            unsafe {
-                SendMessageW(
-                    list,
-                    LVM_SETITEMW,
-                    None,
-                    Some(LPARAM(&item as *const _ as isize)),
-                );
+        if let Some(icon) = entry.icon {
+            if attached != icon.images {
+                unsafe { SendMessageW(list,LVM_SETIMAGELIST,Some(WPARAM(LVSIL_SMALL as usize)),Some(LPARAM(icon.images))); }
+                attached = icon.images;
             }
+            let item = LVITEMW { mask: LVIF_IMAGE, iItem: row as i32, iImage: icon.index, ..Default::default() };
+            unsafe { SendMessageW(list,LVM_SETITEMW,None,Some(LPARAM(&item as *const _ as isize))); }
         }
     }
     Ok((list, count, items.len()))

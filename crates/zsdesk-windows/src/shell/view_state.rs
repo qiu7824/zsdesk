@@ -81,6 +81,18 @@ pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
 }
 
 impl ExplorerBrowserHost {
+    pub fn date_columns(&self)->Option<(bool,bool)> {
+        let manager = unsafe { self.current_view() }.ok()?.cast::<IColumnManager>().ok()?;
+        let keys = visible_column_keys(&manager)?;
+        Some((keys.contains(&super::commands::PKEY_MODIFIED),keys.contains(&super::commands::PKEY_CREATED)))
+    }
+    pub fn toggle_date_column(&self, created:bool)->windows::core::Result<()> {
+        let manager = unsafe { self.current_view()? }.cast::<IColumnManager>()?;
+        let key = if created {super::commands::PKEY_CREATED} else {super::commands::PKEY_MODIFIED};
+        let mut keys = visible_column_keys(&manager).ok_or_else(||windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        if keys.contains(&key) { keys.retain(|k| *k!=key); } else { keys.push(key); }
+        unsafe { manager.SetColumns(&keys) }
+    }
     pub fn select_children(&self,names:&[std::ffi::OsString])->windows::core::Result<()> {
         self.select_children_batch(names,true,&||true)
     }

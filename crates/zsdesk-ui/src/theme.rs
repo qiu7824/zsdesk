@@ -11,6 +11,19 @@ pub enum Mode { Light, Dark }
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub struct TabAppearance { pub fill:Option<Color>,pub border:Option<Color>,pub text:Color,pub weight:u16 }
 
+impl TabAppearance {
+    pub fn with_rgb(mut self, [r,g,b]:[u8;3]) -> Self {
+        self.fill = Some(Color::rgb(r,g,b));
+        let linear = |v:u8| {
+            let c=f32::from(v)/255.0;
+            if c<=0.04045 {c/12.92} else {((c+0.055)/1.055).powf(2.4)}
+        };
+        let y=0.2126*linear(r)+0.7152*linear(g)+0.0722*linear(b);
+        self.text=if y>0.179 { Color::rgb(0,0,0) } else { Color::rgb(255,255,255) };
+        self
+    }
+}
+
 /// Colors for one theme mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
@@ -101,7 +114,7 @@ impl Palette {
     pub fn for_mode(mode: Mode) -> Self {
         let mut palette=match mode { Mode::Light => Self::light(), Mode::Dark => Self::dark() };
         if let Some(native)=high_contrast_palette(mode){
-            let role=|value|native.resolve(value);
+            let role=native;
             palette.strip=role(ColorRole::Surface);palette.layer=role(ColorRole::SurfaceRaised);palette.content=role(ColorRole::Surface);
             palette.text=role(ColorRole::PrimaryText);palette.text_secondary=role(ColorRole::SecondaryText);palette.text_disabled=role(ColorRole::DisabledText);
             palette.accent=role(ColorRole::Accent);palette.accent_text=role(ColorRole::AccentText);
@@ -185,7 +198,7 @@ impl FencePalette {
     /// `opacity` is the background opacity in percent (10–100).
     pub fn new(mode: Mode, opacity: u8) -> Self {
         if let Some(native)=high_contrast_palette(mode){
-            let role=|value|native.resolve(value);
+            let role=native;
             return Self{background:role(ColorRole::Surface),title:role(ColorRole::SurfaceRaised),border:role(ColorRole::StrongStroke),
                 text:role(ColorRole::PrimaryText),text_secondary:role(ColorRole::SecondaryText),text_shadow:Color::rgba(0,0,0,0),
                 hover:role(ColorRole::Control),chip:role(ColorRole::Control),selected:role(ColorRole::Surface),
@@ -228,12 +241,22 @@ impl FencePalette {
     }
 }
 
-fn high_contrast_palette(mode:Mode)->Option<zsui::PlatformPalette>{
-    let mode=match mode{Mode::Light=>zsui::ZsuiThemeMode::Light,Mode::Dark=>zsui::ZsuiThemeMode::Dark};
-    zsui::PlatformPalette::current(mode).ok().filter(|palette|palette.mode==zsui::ZsuiThemeMode::HighContrast)
+fn high_contrast_palette(_mode:Mode)->Option<impl Fn(ColorRole)->Color>{
+    #[cfg(windows)]
+    let [bg,fg,selection,selected_text]=zsdesk_windows::theme::high_contrast_colors()?;
+    #[cfg(not(windows))]
+    let [bg,fg,selection,selected_text]=None::<[[u8;3];4]>?;
+    Some(move |role|{
+        let [r,g,b]=match role {
+            ColorRole::Surface|ColorRole::SurfaceRaised|ColorRole::Control=>bg,
+            ColorRole::Accent=>selection,ColorRole::AccentText=>selected_text,
+            _=>fg,
+        };
+        Color::rgb(r,g,b)
+    })
 }
 
-/// Segoe Fluent Icons / Segoe MDL2 Assets code points. Semantic icons come
+/// Segoe Fluent/// Segoe Fluent Icons / Segoe MDL2 Assets code points. Semantic icons come
 /// from ZSUI's [`ZsIcon`]; Explorer-specific glyphs are listed here.
 pub mod glyph {
     use super::ZsIcon;
@@ -287,6 +310,15 @@ mod tests {
             assert_eq!(style.text,if active{p.text}else{p.text_secondary});
             if !selected{assert_eq!(style,p.tab_appearance(false,active,true));}
         }}}
+    }
+    #[test]
+    fn custom_tab_colors_keep_text_legible() {
+        for rgb in [[0,0,0],[255,255,255],[28,117,187],[231,149,28],[119,119,119]] {
+            let tab=Palette::light().tab_appearance(true,true,false).with_rgb(rgb);
+            let fill=tab.fill.unwrap();
+            assert_eq!([fill.r,fill.g,fill.b],rgb);
+            assert!(contrast(tab.text,fill)>=4.5);
+        }
     }
     #[test]fn opted_in_tabs_keep_neutral_borders_and_readable_text_when_inactive(){
         for p in [Palette::light(),Palette::dark()]{

@@ -56,6 +56,7 @@ impl Loader {
         let worker = thread::Builder::new()
             .name("zsdesk-parent-column".into())
             .spawn(move || {
+                let apartment = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED) };
                 while let Ok(first) = rx.recv() {
                     let (id, parent, hidden) = rx.try_iter().last().unwrap_or(first);
                     if revision.load(Ordering::Acquire) != id {
@@ -70,10 +71,13 @@ impl Loader {
                             .map(|(rows, _)| rows);
                         } else {
                             let mask = unsafe { GetLogicalDrives() };
+                            let mut icons = folder_contents::TypeIcons::default();
                             for i in 0..26 {
                                 if mask & (1 << i) != 0 {
+                                    let name = format!("{}:\\", char::from(b'A' + i));
                                     rows.push(Entry {
-                                        name: format!("{}:\\", char::from(b'A' + i)).into(),
+                                        icon: icons.get(Path::new(&name), true, true),
+                                        name: name.into(),
                                         folder: true,
                                     });
                                 }
@@ -91,6 +95,7 @@ impl Loader {
                         };
                     }
                 }
+                if apartment.is_ok() { unsafe { windows::Win32::System::Com::CoUninitialize(); } }
             })?;
         Ok(Self {
             requests,
@@ -182,7 +187,10 @@ impl ParentColumn {
             core::Interface,
             Win32::UI::Shell::{IColumnManager, CM_COLUMNINFO, CM_MASK_WIDTH},
         };
-        let width = width.clamp(48, 16384) as u32;
+        let view_width = self.middle_layout.as_ref().and_then(|(view,_)| unsafe { view.GetWindow() }.ok())
+            .and_then(|hwnd| { let mut r = RECT::default(); unsafe { GetClientRect(hwnd,&mut r) }.ok().map(|_| r.right) })
+            .filter(|w| *w > 0).unwrap_or(width);
+        let width = width.min(view_width).clamp(1, 16384) as u32;
         if self.middle_width == Some(width) {
             return;
         }
@@ -326,6 +334,16 @@ impl ParentColumn {
             && wp.0 & 0xffff == ID
             && wp.0 >> 16 == LBN_SELCHANGE as usize
     }
+    pub(super) fn activate_file(&self, wp: WPARAM, lp: LPARAM) -> bool {
+        if !self.active || lp.0 != self.list.0 as isize || wp.0 >> 16 != LBN_DBLCLK as usize { return false; }
+        let n = unsafe { SendMessageW(self.list, LB_GETCURSEL, None, None) }.0;
+        if let Some(row) = self.rows.get(n as usize).filter(|row| !row.folder) {
+            if let Some(parent) = &self.parent {
+                unsafe { zsdesk_windows::shell::open_path(self.list,&parent.join(&row.name)); }
+            }
+        }
+        true
+    }
     pub(super) fn owns(&self, hwnd: HWND) -> bool {
         self.active && hwnd == self.list
     }
@@ -359,7 +377,14 @@ impl ParentColumn {
             let mut r = d.rcItem;
             r.left += scale(6, dpi);
             let icon = self.icons[row.folder as usize];
-            if !icon.is_invalid() {
+            let drawn = row.icon.is_some_and(|image| unsafe {
+                windows::Win32::UI::Controls::ImageList_DrawEx(
+                    windows::Win32::UI::Controls::HIMAGELIST(image.images), image.index, d.hDC,
+                    r.left, r.top + (r.bottom-r.top-sz)/2, sz, sz, COLORREF(0xffffffff), COLORREF(0xffffffff),
+                    windows::Win32::UI::Controls::ILD_TRANSPARENT)
+                .as_bool()
+            });
+            if !drawn && !icon.is_invalid() {
                 let _ = unsafe {
                     DrawIconEx(
                         d.hDC,
@@ -508,34 +533,7 @@ impl WindowState {
         }
         if self.columns.active {
             self.refresh_parent_column();
-            if self.columns.middle_layout.is_none() {
-                if let Some(view) = self
-                    .browser
-                    .as_ref()
-                    .and_then(|b| unsafe { b.current_view() }.ok())
-                {
-                    if let Some(original) = zsdesk_windows::shell::capture_background_layout(&view)
-                    {
-                        if !original.columns.is_empty() {
-                            let key = zsdesk_windows::shell::commands::PKEY_NAME;
-                            let mut list = original.clone();
-                            list.mode = 4;
-                            list.icon_size = 16;
-                            list.column_dpi = self.session.ui.interface_dpi(self.dpi);
-                            list.columns = vec![ViewColumn {
-                                key: ViewPropertyKey {
-                                    format_id: format!("{:?}", key.fmtid),
-                                    property_id: key.pid,
-                                },
-                                width: (self.layout.browser.width - self.s(24)).clamp(48, 16384)
-                                    as u32,
-                            }];
-                            self.columns.middle_layout = Some((view.clone(), original));
-                            zsdesk_windows::shell::restore_view_layout(&view, &list);
-                        }
-                    }
-                }
-            }
+            self.configure_middle_column();
         }
         if self.preview_rect.is_some() {
             unsafe {
@@ -543,6 +541,37 @@ impl WindowState {
             }
         }
         self.current_layout() == layout
+    }
+    fn configure_middle_column(&mut self) {
+        if self.columns.middle_layout.is_some() { return; }
+        let Some(browser) = &self.browser else { return; };
+        let Ok(view) = (unsafe { browser.current_view() }) else { return; };
+        let Some(mut original) = zsdesk_windows::shell::capture_background_layout(&view) else { return; };
+        // Some icon views expose no columns until switched to Details. Keep the
+        // original mode together with those widths so leaving Columns restores both.
+        if original.columns.is_empty() {
+            if browser.set_view_mode(4, 16).is_err() { return; }
+            let details = zsdesk_windows::shell::capture_background_layout(&view);
+            let Some(details) = details.filter(|d| !d.columns.is_empty()) else {
+                zsdesk_windows::shell::restore_view_layout(&view, &original);
+                return;
+            };
+            original.columns = details.columns;
+            original.column_dpi = details.column_dpi;
+        }
+        let width = self.layout.browser.width - unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi) } - self.s(12);
+        let key = zsdesk_windows::shell::commands::PKEY_NAME;
+        let mut layout = original.clone();
+        layout.mode = 4;
+        layout.icon_size = 16;
+        layout.column_dpi = self.dpi;
+        layout.columns = vec![ViewColumn {
+            key: ViewPropertyKey { format_id: format!("{:?}",key.fmtid), property_id:key.pid },
+            width: width.clamp(1,16384) as u32,
+        }];
+        self.columns.middle_layout = Some((view.clone(),original));
+        zsdesk_windows::shell::restore_view_layout(&view,&layout);
+        self.columns.fit_middle(width);
     }
     pub(super) fn restore_folder_layout(&mut self) {
         if self.picker.is_some() {

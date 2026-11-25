@@ -9,8 +9,11 @@ use super::*;
     let paths=vec![root.join("文件一.txt"),root.join("另一目录").join("文件二.txt")];
     for path in &paths{std::fs::write(path,b"clipboard-format-fixture").unwrap();}
     let sequence=unsafe{GetClipboardSequenceNumber()};
+    let drag=file_data_object(HWND::default(),&paths,None).unwrap();
+    let files=FORMATETC{cfFormat:15,dwAspect:DVASPECT_CONTENT.0, lindex:-1,tymed:TYMED_HGLOBAL.0 as u32,..Default::default()};
+    assert!(unsafe{drag.QueryGetData(&files)}.is_ok());
     for cut in [false,true]{
-        let data=file_data_object(HWND::default(),&paths,cut).unwrap();
+        let data=file_data_object(HWND::default(),&paths,Some(cut)).unwrap();
         for name in [CFSTR_SHELLIDLIST,CFSTR_PREFERREDDROPEFFECT]{
             let format=unsafe{RegisterClipboardFormatW(name)};
             let request=FORMATETC{cfFormat:format as u16,ptd:std::ptr::null_mut(),dwAspect:DVASPECT_CONTENT.0,lindex:-1,tymed:TYMED_HGLOBAL.0 as u32};
@@ -497,8 +500,8 @@ fn filesystem_cut_publishes_move_before_marking_the_source() -> anyhow::Result<(
         impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
         let _fixture = Fixture(dir);
         for path in &paths { fs::write(path, b"cut fixture")?; }
-        let cut = file_data_object(HWND::default(), &paths, true)?;
-        let copy = file_data_object(HWND::default(), &paths, false)?;
+        let cut = file_data_object(HWND::default(), &paths, Some(true))?;
+        let copy = file_data_object(HWND::default(), &paths, Some(false))?;
         let sequence = || unsafe { GetClipboardSequenceNumber() };
         let marked = Cell::new(false);
         publish_view_cut(&cut, sequence(), || Ok(true), || {

@@ -19,7 +19,8 @@ extern "system" {
     fn FileTimeToLocalFileTime(input: *const FILETIME, output: *mut FILETIME) -> i32;
     fn FileTimeToSystemTime(input: *const FILETIME, output: *mut SYSTEMTIME) -> i32;
 }
-fn date(t: u64) -> String {
+pub(crate) fn date(t: u64) -> String {
+    if t == 0 { return "—".into(); }
     let utc = FILETIME {
         dwLowDateTime: t as u32,
         dwHighDateTime: (t >> 32) as u32,
@@ -42,6 +43,7 @@ pub(crate) struct Detail {
     pub path: PathBuf,
     pub size: String,
     pub modified: String,
+    pub created: String,
     pub folder: bool,
 }
 #[derive(Default)]
@@ -85,6 +87,7 @@ impl Reader {
                     Some(m)=>zsdesk_ui::chrome::format_size(m.len()),
                     None=>"—".into(),
                 };
+                let created=meta.as_ref().map_or_else(||"—".into(),|m|date(m.creation_time()));
                 let modified=meta.as_ref().map_or_else(||"—".into(),|m|date(m.last_write_time()));
                 let state = shared.0.lock().unwrap_or_else(|e| e.into_inner());
                 if state.closed {
@@ -97,7 +100,7 @@ impl Reader {
                             row,
                             path,
                             size,
-                            modified,folder,
+                            modified,created,folder,
                         })
                         .is_err()
                     {

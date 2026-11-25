@@ -115,9 +115,26 @@ impl TextStyle {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FormatKey { font: Font, size: u32, weight: u16, align: Align, center: bool, wrap: bool, ellipsis: bool }
 
+/// Reclaim unused pages in the process heaps after graphics allocations have been freed.
+pub fn reclaim_unused_heap_pages() {
+    use std::sync::Mutex;
+    use std::time::{Duration,Instant};
+    use windows::Win32::System::{Memory::{HeapSetInformation,HeapOptimizeResources},SystemServices::{HEAP_OPTIMIZE_RESOURCES_INFORMATION,HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION}};
+    static LAST:Mutex<Option<Instant>>=Mutex::new(None);
+    let Ok(mut last)=LAST.try_lock() else{return;};
+    if last.is_some_and(|t|t.elapsed()<Duration::from_secs(60)){return;}
+    *last=Some(Instant::now());
+    drop(last);
+    let options=HEAP_OPTIMIZE_RESOURCES_INFORMATION{Version:HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,Flags:0};
+    let _=unsafe{HeapSetInformation(None,HeapOptimizeResources,Some((&options as *const HEAP_OPTIMIZE_RESOURCES_INFORMATION).cast()),std::mem::size_of_val(&options))};
+}
+
+/// Keep paint resources across a burst of input, then drop the backing buffers.
+pub const PAINT_IDLE_MS:u32=2_000;
+
 /// Owner of the device-independent factories and one DC render target.
 pub struct Gfx {
-    d2d: ID2D1Factory,
+    d2d: RefCell<Option<ID2D1Factory>>,
     dwrite: IDWriteFactory,
     wic: RefCell<Option<IWICImagingFactory>>,
     target: RefCell<Option<(ID2D1DCRenderTarget, ID2D1SolidColorBrush)>>,
@@ -133,7 +150,7 @@ impl Gfx {
     pub fn new(ui_family: &str) -> Result<Self> {
         let d2d: ID2D1Factory = unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)? };
         let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
-        let mut gfx = Self { d2d, dwrite, wic: RefCell::new(None), target: RefCell::new(None), formats: RefCell::new(HashMap::new()),
+        let mut gfx = Self { d2d: RefCell::new(Some(d2d)), dwrite, wic: RefCell::new(None), target: RefCell::new(None), formats: RefCell::new(HashMap::new()),
             ui_family: wide(ui_family), icon_family: wide("Segoe MDL2 Assets"), generation: std::cell::Cell::new(1), format_clock: std::cell::Cell::new(0) };
         // Windows 11 ships Segoe Fluent Icons; Windows 10 / Server keep the MDL2 glyph font with the same code points.
         if gfx.family_exists("Segoe Fluent Icons") { gfx.icon_family = wide("Segoe Fluent Icons"); }
@@ -145,6 +162,13 @@ impl Gfx {
     /// The generation changes whenever the target is recreated.
     pub fn generation(&self) -> u64 { self.generation.get() }
 
+    fn drawing_factory(&self) -> Result<ID2D1Factory> {
+        if let Some(factory)=self.d2d.borrow().as_ref(){ return Ok(factory.clone()); }
+        let factory:ID2D1Factory=unsafe{D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,None)}?;
+        *self.d2d.borrow_mut()=Some(factory.clone());
+        Ok(factory)
+    }
+
     /// Releases the DC target's backing allocation while no content is visible.
     /// Callers discard target-owned bitmaps first; WIC data can be uploaded again.
     pub fn release_device_resources(&self) {
@@ -152,6 +176,7 @@ impl Gfx {
             self.generation.set(self.generation.get().wrapping_add(1));
         }
         self.wic.borrow_mut().take();
+        self.d2d.borrow_mut().take();
     }
 
     pub fn cache_stats(&self) -> (usize, bool) { (self.formats.borrow().len(), self.target.borrow().is_some()) }
@@ -183,7 +208,7 @@ impl Gfx {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0, dpiY: 96.0, usage: D2D1_RENDER_TARGET_USAGE_NONE, minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
         };
-        let target = unsafe { self.d2d.CreateDCRenderTarget(&props)? };
+        let target = unsafe { self.drawing_factory()?.CreateDCRenderTarget(&props)? };
         let brush = unsafe { target.CreateSolidColorBrush(&Color::TRANSPARENT.d2d(), None)? };
         unsafe { target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE); }
         *self.target.borrow_mut() = Some((target.clone(), brush.clone()));
@@ -268,6 +293,25 @@ impl Gfx {
     pub fn wic_from_icon(&self, icon: HICON) -> Option<IWICBitmapSource> {
         let bitmap = unsafe { self.imaging_factory()?.CreateBitmapFromHICON(icon).ok()? };
         self.convert(&bitmap.cast().ok()?)
+    }
+
+    /// Recolor the stock Shell folder in premultiplied BGRA, preserving its silhouette and folds.
+    pub fn white_folder_icon(&self, icon: HICON) -> Option<IWICBitmapSource> {
+        let source = self.wic_from_icon(icon)?;
+        let (width, height) = Self::wic_size(&source);
+        if width == 0 || height == 0 || width > 256 || height > 256 { return None; }
+        let stride = width * 4;
+        let mut pixels = vec![0u8; (stride * height) as usize];
+        unsafe { source.CopyPixels(std::ptr::null(), stride, &mut pixels) }.ok()?;
+        for pixel in pixels.chunks_exact_mut(4) {
+            let [b,g,r,a] = [pixel[0],pixel[1],pixel[2],pixel[3]];
+            let luminance = (54*u32::from(r) + 183*u32::from(g) + 19*u32::from(b)) / 256;
+            let white = (luminance * 4 / 3).min(u32::from(a)) as u8;
+            pixel[..3].fill(white);
+        }
+        let bitmap = unsafe { self.imaging_factory()?.CreateBitmapFromMemory(
+            width, height, &GUID_WICPixelFormat32bppPBGRA, stride, &pixels) }.ok()?;
+        bitmap.cast().ok()
     }
 
     /// Converts a 32-bit HBITMAP. `alpha` selects straight alpha, premultiplied alpha or opaque pixels.
@@ -391,7 +435,7 @@ impl Canvas<'_> {
     /// Windows 11 tab silhouette: rounded top corners and concave feet that
     /// merge into the toolbar below.
     pub fn tab_shape(&self, rect: RectF, radius: f32, foot: f32, color: Color) {
-        let Ok(path) = (unsafe { self.gfx.d2d.CreatePathGeometry() }) else { return };
+        let Ok(path) = self.gfx.drawing_factory().and_then(|factory| unsafe { factory.CreatePathGeometry() }) else { return };
         let Ok(sink) = (unsafe { path.Open() }) else { return };
         let (l, t, r, b) = (rect.x, rect.y, rect.right(), rect.bottom());
         let k = 0.552_284_8_f32;
@@ -476,6 +520,27 @@ fn utf16(text: &str) -> Vec<u16> { text.encode_utf16().collect() }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_target_rebuild_preserves_the_painted_frame() -> Result<()> {
+        let gfx=Gfx::new("Segoe UI")?;
+        let draw=|| {
+            let surface=Surface::new(96,40).unwrap();
+            gfx.draw(&surface,|cv|{
+                cv.fill(RectF::new(0.,0.,96.,40.),Color::rgba8(255,255,255,255));
+                cv.tab_shape(RectF::new(8.,4.,76.,32.),7.,4.,Color::rgba8(48,92,182,255));
+                cv.text("库 ABC",RectF::new(14.,6.,60.,26.),&TextStyle::ui(13.),Color::rgba8(255,255,255,255));
+            })?;
+            Ok::<_,windows::core::Error>(unsafe{std::slice::from_raw_parts(surface.bits,surface.pixel_bytes() as usize)}.to_vec())
+        };
+        let original=draw()?;
+        let generation=gfx.generation();
+        gfx.release_device_resources();
+        assert!(!gfx.cache_stats().1 && gfx.d2d.borrow().is_none());
+        assert_ne!(generation,gfx.generation());
+        assert_eq!(draw()?,original);
+        Ok(())
+    }
+
     #[test]
     fn rect_helpers_never_go_negative() {
         let r = RectF::new(0.0, 0.0, 4.0, 4.0).inset(3.0, 3.0);

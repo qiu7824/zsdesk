@@ -148,6 +148,52 @@ impl Icon<'_, '_> {
             }
         }
     }
+    pub(super) fn command(&self, command: zsdesk_core::model::explorer::CommandBarItem) {
+        use zsdesk_core::model::explorer::CommandBarItem::*;
+        let (ink, accent) = (self.ink, self.accent);
+        match command {
+            Cut => self.toolbar(Action::Cut),
+            Copy => self.toolbar(Action::Copy),
+            Rename => self.toolbar(Action::Rename),
+            Share => self.toolbar(Action::Share),
+            Delete => self.toolbar(Action::Delete),
+            New => { self.body("newfolder"); }
+            Sort => { self.body("arrange"); }
+            Paste => {
+                self.outline(2.5, 2.5, 11., 12.5, 2., ink);
+                self.cv.round(self.box_at(5., 1., 6., 3.), self.rect.w/16., self.paper);
+                self.outline(5., 1., 6., 3., 1., accent);
+            }
+            NewFolder | ExtractHere => {
+                self.line(&[(1.,5.),(1.,3.),(6.,3.),(8.,5.),(14.,5.),(15.,6.),(15.,14.),(1.,14.),(1.,5.)],ink);
+                self.line(&[(3.,6.5),(7.,6.5)],accent);
+                if command == ExtractHere {
+                    self.line(&[(10.,6.5),(10.,11.5)],accent);
+                    self.line(&[(7.5,9.),(10.,11.5),(12.5,9.)],accent);
+                } else {
+                    self.line(&[(8.,10.),(12.,10.)],accent);
+                    self.line(&[(10.,8.),(10.,12.)],accent);
+                }
+            }
+            View => {
+                for y in [3.,8.,13.] {
+                    self.line(&[(1.,y),(3.,y)],accent);
+                    self.line(&[(5.,y),(15.,y)],ink);
+                }
+            }
+            PreviewPane | DetailsPane => {
+                self.outline(1.,2.,14.,12.,2.,ink);
+                self.line(&[(9.,2.),(9.,14.)],accent);
+                if command == DetailsPane {
+                    for y in [5.,8.,11.] { self.line(&[(10.5,y),(13.,y)],accent); }
+                }
+            }
+            More => {
+                for x in [1.5,7.,12.5] { self.cv.round(self.box_at(x,7.,2.,2.),self.rect.w/16.,ink); }
+            }
+        }
+    }
+
     pub fn body(&self, verb: &str) -> bool {
         let (ink, blue) = (self.ink, self.accent);
         match verb {

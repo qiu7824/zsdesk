@@ -16,6 +16,12 @@ use super::ContextMenuOptions;
 #[path="drawn_menu/command_icons.rs"]
 mod command_icons;
 
+/// The file window and the context menu use the same 16-DIP outlines.
+pub fn paint_command_icon(cv:&Canvas,rect:RectF,command:zsdesk_core::model::explorer::CommandBarItem,
+    ink:Color,accent:Color,paper:Color) {
+    command_icons::Icon{cv,rect,ink,accent,paper}.command(command);
+}
+
 const CLASS:windows::core::PCWSTR=w!("ZSDesk.ShellFlyout");
 const TIMER:usize=0x5a53464c;
 const MAX_ITEMS:usize=16384;

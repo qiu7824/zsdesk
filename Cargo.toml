@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.7"
 edition = "2021"
 license = "MIT"
 rust-version = "1.89"
@@ -26,8 +26,7 @@ dirs = "6"
 opt-level = 3
 lto = "thin"
 
-# Size-oriented code generation for Win32 integration. Search matching retains
-# the workspace release optimization level.
+# Size-oriented code generation for the Windows release.
 [profile.release.package.zsdesk-windows]
 opt-level = "s"
 
@@ -37,17 +36,7 @@ opt-level = "s"
 [profile.release.package.zsui]
 opt-level = "s"
 
-# Keep the search engine at -O3. A single application codegen unit allows
-# the optimizer to share more code across the window and command handlers.
+# Share code across the application and optimize for offline distribution.
 [profile.release.package.zsdesk-app]
+opt-level = "s"
 codegen-units = 1
-
-# Font shaping and rasterization are reused by the ZSUI painter.
-[profile.release.package.skrifa]
-opt-level = "s"
-
-[profile.release.package.harfrust]
-opt-level = "s"
-
-[profile.release.package.swash]
-opt-level = "s"

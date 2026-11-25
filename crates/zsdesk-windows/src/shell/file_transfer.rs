@@ -161,17 +161,22 @@ fn hdrop_bytes(paths:&[PathBuf])->Result<Vec<u8>>{
     bytes.extend([0,0]);Ok(bytes)
 }
 pub fn copy_paths(owner:HWND,paths:&[PathBuf],cut:bool)->Result<()>{
-    let data=file_data_object(owner,paths,cut)?;
+    let data=file_data_object(owner,paths,Some(cut))?;
     unsafe{windows::Win32::System::Ole::OleSetClipboard(&data)}
 }
-fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32::System::Com::IDataObject>{
+pub fn drag_paths(owner:HWND,paths:&[PathBuf])->Result<()> {
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY,DROPEFFECT_MOVE,DROPEFFECT_LINK};
+    let data=file_data_object(owner,paths,None)?;
+    unsafe { windows::Win32::UI::Shell::SHDoDragDrop(Some(owner),&data,None,DROPEFFECT_COPY|DROPEFFECT_MOVE|DROPEFFECT_LINK) }.map(|_| ())
+}
+fn file_data_object(owner:HWND,paths:&[PathBuf],cut:Option<bool>)->Result<windows::Win32::System::Com::IDataObject>{
     // Shell's IDataObject carries CIDA and delayed descriptor/content formats
     // used by remote clipboard bridges and copy handlers, as well as HDROP.
     check_paths(paths)?;
     let pidls=paths.iter().map(|path|super::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone()))
         .ok_or_else(||invalid(zsdesk_core::i18n::text("无法读取文件标识")))).collect::<Result<Vec<_>>>()?;
     let data=crate::desktop::data_object(owner,&pidls)?;
-    set_drop_effect(&data, cut)?;
+    if let Some(cut)=cut { set_drop_effect(&data,cut)?; }
     Ok(data)
 }
 
@@ -264,7 +269,7 @@ pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
     // Publish MOVE before asking DefView to ghost the selection.
     let data = match unsafe { view.GetItemObject(SVGIO_SELECTION) } {
         Ok(data) if set_drop_effect(&data, true).is_ok() => data,
-        _ => file_data_object(owner, &paths, true)?,
+        _ => file_data_object(owner, &paths, Some(true))?,
     };
     let folder = view.cast::<IShellFolderView>();
     let window = unsafe { view.GetWindow() }.ok();

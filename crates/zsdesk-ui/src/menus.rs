@@ -218,6 +218,11 @@ fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
             ]),
         submenu(zsdesk_core::i18n::text("导航窗格选项"), vec![
             entry(zsdesk_core::i18n::text("展开到当前文件夹"), "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
+            submenu(zsdesk_core::i18n::text("库"),vec![
+                entry(zsdesk_core::i18n::text("跟随系统"),"navigation-libraries-system",true,ui.navigation_show_libraries.is_none()),
+                entry(zsdesk_core::i18n::text("显示库"),"navigation-libraries-show",true,ui.navigation_show_libraries==Some(true)),
+                entry(zsdesk_core::i18n::text("隐藏库"),"navigation-libraries-hide",true,ui.navigation_show_libraries==Some(false)),
+            ]),
             entry(zsdesk_core::i18n::text("显示回收站"), "navigation-recycle-bin", true, ui.navigation_show_recycle_bin),
             entry(zsdesk_core::i18n::text("显示网络"), "navigation-network", true, ui.navigation_show_network),
             MenuItemSpec::Separator,
@@ -234,6 +239,18 @@ fn tab_settings(ui: &ExplorerUi) -> MenuItemSpec {
         entry(zsdesk_core::i18n::text("标签栏在上方"), "tab-placement-top", true, ui.tab_placement == TabPlacement::Top),
         entry(zsdesk_core::i18n::text("标签栏在左侧"), "tab-placement-left", true, ui.tab_placement == TabPlacement::Left),
         entry(zsdesk_core::i18n::text("标签栏在右侧"), "tab-placement-right", true, ui.tab_placement == TabPlacement::Right),
+        submenu(zsdesk_core::i18n::text("标签页圆角"), vec![
+            entry(zsdesk_core::i18n::text("默认"),"tab-radius-default",true,ui.tab_style.radius.is_none()),
+            entry("0 DIP","tab-radius-0",true,ui.tab_style.radius==Some(0)),
+            entry("4 DIP","tab-radius-4",true,ui.tab_style.radius==Some(4)),
+            entry("8 DIP","tab-radius-8",true,ui.tab_style.radius==Some(8)),
+            entry("12 DIP","tab-radius-12",true,ui.tab_style.radius==Some(12)),
+        ]),
+        submenu(zsdesk_core::i18n::text("标签页配色"),vec![
+            item(zsdesk_core::i18n::text("当前标签颜色…"),"tab-color-selected"),
+            item(zsdesk_core::i18n::text("其他标签颜色…"),"tab-color-inactive"),
+            item(zsdesk_core::i18n::text("恢复主题配色"),"tab-color-default"),
+        ]),
         entry(zsdesk_core::i18n::text("紧凑侧边标签"), "side-tabs-compact", true, ui.side_tabs_compact),
         entry(zsdesk_core::i18n::text("恢复侧边标签宽度"), "side-tabs-width-reset", ui.tab_placement != TabPlacement::Top, false),
         MenuItemSpec::Separator,
@@ -297,19 +314,18 @@ fn search_settings(ui: &ExplorerUi) -> MenuItemSpec {
         MenuItemSpec::Separator,
         item(zsdesk_core::i18n::text("重建文件名索引"), "search-rebuild-index"),
         entry(zsdesk_core::i18n::text("Everything 索引设置…"), "search-index-settings",!builtin,false),
-        entry(zsdesk_core::i18n::text("启用 Everything 索引服务…"), "search-everything-service",!builtin,false),
-        entry(zsdesk_core::i18n::text("选择已安装的 Everything…"), "search-everything-program",!builtin,ui.everything_executable.is_some()),
-        entry(zsdesk_core::i18n::text("自动选择已安装或内置 Everything"), "search-everything-auto",!builtin,ui.everything_executable.is_none()),
+        entry(zsdesk_core::i18n::text("选择已安装的 Everything…"), "search-everything-program",true,ui.everything_executable.is_some()),
+        entry(zsdesk_core::i18n::text("解除 Everything 绑定"), "search-everything-clear",ui.everything_executable.is_some(),false),
         item(zsdesk_core::i18n::text("搜索引擎状态…"), "search-engine-status"),
     ])
 }
 
 /// Applies a recognized settings choice; the host then saves and relayouts.
-pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-everything-program"|"startup-folder"|"new-tab-folder")}
+pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"tab-color-selected"|"tab-color-inactive"|"search-everything-program"|"search-backend-everything"|"startup-folder"|"new-tab-folder")}
 
 /// Settings entries that run an action instead of toggling a preference.
 pub fn interface_action(choice:&str)->bool{
-    matches!(choice,"system-text-size"|"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"search-engine-status"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
+    matches!(choice,"system-text-size"|"search-rebuild-index"|"search-index-settings"|"search-engine-status"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
 }
 
 pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
@@ -319,6 +335,9 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "interface-navigation" => ui.show_tree = !ui.show_tree,
         "navigation-auto-expand" => ui.navigation_auto_expand = Some(!ui.navigation_auto_expand.unwrap_or(false)),
         "navigation-expand-system" => ui.navigation_auto_expand = None,
+        "navigation-libraries-system"=>ui.navigation_show_libraries=None,
+        "navigation-libraries-show"=>ui.navigation_show_libraries=Some(true),
+        "navigation-libraries-hide"=>ui.navigation_show_libraries=Some(false),
         "navigation-recycle-bin"=>ui.navigation_show_recycle_bin=!ui.navigation_show_recycle_bin,
         "navigation-network"=>ui.navigation_show_network=!ui.navigation_show_network,
         "navigation-this-pc-auto"=>ui.navigation_expand_this_pc=None,
@@ -354,6 +373,12 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         }
         "close-window-last-tab"=>ui.close_window_on_last_tab=!ui.close_window_on_last_tab,
         "show-tab-count"|"show-tab-list"=>{let visible=!ui.tab_count_button_visible();ui.show_tab_count=visible;ui.show_tab_list=visible;},
+        "tab-radius-default" => ui.tab_style.radius=None,
+        "tab-radius-0" => ui.tab_style.radius=Some(0),
+        "tab-radius-4" => ui.tab_style.radius=Some(4),
+        "tab-radius-8" => ui.tab_style.radius=Some(8),
+        "tab-radius-12" => ui.tab_style.radius=Some(12),
+        "tab-color-default" => {ui.tab_style.selected_color=None;ui.tab_style.inactive_color=None;}
         "tab-selection-emphasis"=>ui.tab_selection_emphasis=!ui.tab_selection_emphasis,
         "mouse-gestures" => ui.mouse_gestures = !ui.mouse_gestures,
         "everything-folder-sizes" => ui.everything_folder_sizes = !ui.everything_folder_sizes,
@@ -372,7 +397,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "preview-provider-wps" => ui.preview_provider = PreviewProviderPreference::Wps,
         "search-backend-auto"|"search-backend-native"|"search-backend-directory" => ui.search_backend = SearchBackendPreference::NativeNtfs,
         "search-backend-everything"=>ui.search_backend=SearchBackendPreference::Everything,
-        "search-everything-auto"=>ui.everything_executable=None,
+        "search-everything-clear"=>{ui.everything_executable=None;ui.search_backend=SearchBackendPreference::NativeNtfs;}
         "search-native-development"=>ui.search_include_development=!ui.search_include_development,
         "search-native-metadata"=>ui.search_index_metadata=!ui.search_index_metadata,
         "search-native-pinyin"=>ui.search_pinyin_initials=!ui.search_pinyin_initials,
@@ -474,6 +499,7 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
     items.push(group(zsdesk_core::i18n::text("右键菜单"), "settings-context-menu",
         context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
     if themed { items.push(group(zsdesk_core::i18n::text("主题与材质"), "settings-appearance", appearance_menu(&ui.appearance).items)); }
+    else { items.push(group(zsdesk_core::i18n::text("界面颜色"), "settings-appearance", color_items(ui.appearance.color_scheme))); }
     if let Some(running) = state.desktop_running {
         items.push(group(zsdesk_core::i18n::text("桌面格子"), "settings-desktop", vec![
             item(if running { zsdesk_core::i18n::text("显示桌面格子") } else { zsdesk_core::i18n::text("启动桌面格子") }, "desktop-start"),
@@ -509,17 +535,23 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
 /// Material and color are two independent choices.
 pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
     let backdrop = preferences.backdrop;
-    let scheme = preferences.color_scheme;
-    menu(vec![
+    let mut items = vec![
         entry(zsdesk_core::i18n::text("材质：跟随系统"), "appearance-backdrop-system", true, backdrop == BackdropStyle::System),
         entry(zsdesk_core::i18n::text("材质：Mica"), "appearance-mica", true, backdrop == BackdropStyle::Mica),
         entry(zsdesk_core::i18n::text("材质：亚克力"), "appearance-acrylic", true, backdrop == BackdropStyle::Acrylic),
         entry(zsdesk_core::i18n::text("材质：纯色"), "appearance-solid", true, backdrop == BackdropStyle::Solid),
         MenuItemSpec::Separator,
+    ];
+    items.extend(color_items(preferences.color_scheme));
+    menu(items)
+}
+
+fn color_items(scheme:ColorScheme)->Vec<MenuItemSpec> {
+    vec![
         entry(zsdesk_core::i18n::text("颜色：跟随系统"), "appearance-color-system", true, scheme == ColorScheme::System),
         entry(zsdesk_core::i18n::text("颜色：浅色"), "appearance-color-light", true, scheme == ColorScheme::Light),
         entry(zsdesk_core::i18n::text("颜色：深色"), "appearance-color-dark", true, scheme == ColorScheme::Dark),
-    ])
+    ]
 }
 
 pub fn apply_appearance(preferences: &mut AppearancePreferences, choice: &str) -> bool {
@@ -648,6 +680,13 @@ mod tests {
     }
     #[test]
     fn navigation_expansion_is_an_explicit_reversible_preference() {
+        let mut libraries=ExplorerUi::default();
+        assert_eq!(libraries.navigation_show_libraries,None);
+        for (id,expected) in [("navigation-libraries-hide",Some(false)),("navigation-libraries-show",Some(true)),("navigation-libraries-system",None)]{
+            assert!(nested_ids(&interface_settings_menu(&libraries)).contains(&id.to_string()));
+            assert!(apply_interface_setting(&mut libraries,id));
+            assert_eq!(libraries.navigation_show_libraries,expected);
+        }
         let mut ui=ExplorerUi::default();
         assert_eq!(ui.navigation_auto_expand, None);
         assert!(nested_ids(&interface_settings_menu(&ui)).contains(&"navigation-auto-expand".into()));
@@ -753,7 +792,7 @@ mod tests {
         assert!(apply_interface_setting(&mut ui,"search-native-metadata"));assert!(ui.search_index_metadata);assert!(ui.search_backend.is_builtin());
     }
     #[test]
-    fn everything_program_choice_is_visible_and_can_return_to_auto(){
+    fn everything_program_choice_is_visible_and_can_be_cleared(){
         fn checked(ui:&ExplorerUi,id:&str)->bool{
             let MenuItemSpec::Submenu{menu,..}=search_settings(ui)else{panic!("search group")};
             menu.items.iter().any(|item|matches!(item,MenuItemSpec::Command{command:UiCommand::Custom{id:key,..},checked:true,..} if key==id))
@@ -761,10 +800,10 @@ mod tests {
         let mut ui=ExplorerUi::default();ui.search_backend=SearchBackendPreference::Everything;
         ui.everything_executable=Some(r"E:\Apps\Everything.exe".into());
         let preferences=ui.search_preferences();let mut reopened=ExplorerUi::default();reopened.apply_search_preferences(&preferences);
-        assert!(checked(&reopened,"search-everything-program")&&!checked(&reopened,"search-everything-auto"));
-        assert!(apply_interface_setting(&mut reopened,"search-everything-auto"));
-        assert!(reopened.everything_executable.is_none()&&checked(&reopened,"search-everything-auto")&&!checked(&reopened,"search-everything-program"));
-        assert_eq!(reopened.search_backend,SearchBackendPreference::Everything);
+        assert!(checked(&reopened,"search-everything-program")&&!checked(&reopened,"search-everything-clear"));
+        assert!(apply_interface_setting(&mut reopened,"search-everything-clear"));
+        assert!(reopened.everything_executable.is_none()&&!checked(&reopened,"search-everything-clear")&&!checked(&reopened,"search-everything-program"));
+        assert!(reopened.search_backend.is_builtin());
         assert!(interface_action("search-engine-status"));
     }
 

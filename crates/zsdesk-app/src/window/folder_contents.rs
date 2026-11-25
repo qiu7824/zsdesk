@@ -1,7 +1,40 @@
 use std::{ffi::OsString, fs, io, os::windows::fs::MetadataExt, path::Path};
+use std::collections::HashMap;
+use windows::Win32::UI::Shell::*;
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+
+#[derive(Clone, Copy)]
+pub(super) struct SystemIcon { pub images: isize, pub index: i32 }
+
+#[derive(Default)]
+pub(super) struct TypeIcons(HashMap<(bool, OsString), SystemIcon>);
+
+impl TypeIcons {
+    pub fn get(&mut self, path: &Path, folder: bool, individual:bool) -> Option<SystemIcon> {
+        use std::os::windows::ffi::OsStrExt;
+        let ext = path.extension().unwrap_or_default().to_ascii_lowercase();
+        let per_item = path.parent().is_none() || (individual && !folder && ["exe","ico","lnk","url"].iter().any(|e| ext.eq_ignore_ascii_case(e)));
+        let key = (folder, if folder { OsString::new() } else { ext });
+        if !per_item {
+            if let Some(icon) = self.0.get(&key) { return Some(*icon); }
+        }
+        let mut info = SHFILEINFOW::default();
+        let name: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut flags = SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
+        if !per_item { flags |= SHGFI_USEFILEATTRIBUTES; }
+        let handle = unsafe { SHGetFileInfoW(windows::core::PCWSTR(name.as_ptr()),
+            if folder { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL },
+            Some(&mut info), std::mem::size_of::<SHFILEINFOW>() as u32, flags) };
+        if handle == 0 { return None; }
+        let icon = SystemIcon { images: handle as isize, index: info.iIcon };
+        if !per_item && self.0.len() < 256 { self.0.insert(key, icon); }
+        Some(icon)
+    }
+}
 pub(super) struct Entry {
     pub name: OsString,
     pub folder: bool,
+    pub icon: Option<SystemIcon>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Visibility {
@@ -46,13 +79,19 @@ pub(super) fn entries(
     cancel: impl Fn() -> bool,
 ) -> io::Result<(Vec<Entry>, usize)> {
     let mut rows = Vec::new();
+    let mut icons = TypeIcons::default();
     let mut count = 0;
     for (index, entry) in fs::read_dir(path)?.enumerate() {
         if index % 128 == 0 && cancel() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "目录读取已取消"));
         }
         let entry = entry?;
-        let attrs = entry.metadata()?.file_attributes();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if matches!(e.kind(),io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => continue,
+            Err(e) => return Err(e),
+        };
+        let attrs = metadata.file_attributes();
         if !visibility.includes(attrs) {
             continue;
         }
@@ -60,6 +99,7 @@ pub(super) fn entries(
         if rows.len() < limit {
             rows.push(Entry {
                 name: entry.file_name(),
+                icon: icons.get(&entry.path(), attrs & 16 != 0, limit <= 500),
                 folder: attrs & 16 != 0,
             });
         }

@@ -40,6 +40,7 @@ impl QuickPreview {
         let preview=Self::open_impl(owner,Path::new(""),true,true,provider,dark,hover,bounds)?;
         *preview.state.notice.borrow_mut()=zsdesk_core::i18n::text("正在加载预览…").into();preview.state.invalidate();Ok(preview)
     }
+    pub(super) fn take_activation(&self) -> Option<PathBuf> { self.state.activation.take() }
     pub(super) fn window(&self)->HWND{self.state.hwnd.get()}
     pub(super) fn status(&self)->(String,String){
         let kind=match &*self.state.content.borrow(){Content::Empty=>"information",Content::Handler(preview)=>if preview.rendered.is_some(){"wps"}else{"system"},Content::Text(_)=>"text",Content::Folder(_)=>"folder",Content::Image(_)=>"image",Content::Media(_)=>"media"};
@@ -57,13 +58,14 @@ impl QuickPreview {
         provider: PreviewProviderPreference, dark: bool, hover: bool, embedded:Option<RECT>) -> Result<Self> {
         let _dpi = PreviewDpiScope::for_window(owner);
         let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
-        let class = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: instance,
+        let class = WNDCLASSW { style: CS_DBLCLKS, lpfnWndProc: Some(window_proc), hInstance: instance,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? }, lpszClassName: CLASS_NAME, ..Default::default() };
         if unsafe { RegisterClassW(&class) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
             return Err(Error::from_thread().into());
         }
         let colors=current_preview_colors(dark);
         let state = Rc::new(PreviewState { hwnd: Cell::new(HWND::default()), path: RefCell::new(PathBuf::new()),
+            dates: RefCell::default(), activation: RefCell::default(), text_percent:Cell::new(100),
             summary: RefCell::new(String::new()), notice: RefCell::new(String::new()), content: RefCell::new(Content::Empty),
             font: Cell::new(HFONT::default()), brush:Cell::new(unsafe { CreateSolidBrush(COLORREF(colors.background)) }),
             colors:Cell::new(colors),requested_dark:Cell::new(dark),refreshing_theme:Cell::new(false),laying_out:Cell::new(false),allow_system_handler, provider, hover,embedded:embedded.is_some() });
@@ -102,6 +104,12 @@ impl QuickPreview {
         !preview.0.is_null() && (hwnd == preview || unsafe { IsChild(preview, hwnd) }.as_bool())
     }
 
+    pub(super) fn set_text_percent(&self,percent:u16) {
+        let percent=percent.clamp(100,150);
+        if self.state.text_percent.replace(percent)!=percent {
+            self.state.update_font();self.state.layout_content();self.state.invalidate();
+        }
+    }
     pub(super) fn set_dark(&self,dark:bool){if self.state.requested_dark.replace(dark)!=dark{self.state.refresh_theme();}}
     pub(super) fn update(&mut self, path: &Path) -> Result<()> {
         let _dpi=PreviewDpiScope::for_window(self.state.hwnd.get());
@@ -125,6 +133,14 @@ impl QuickPreview {
                 return Ok(());
             }
         };
+        if self.state.embedded {
+            use std::os::windows::fs::MetadataExt;
+            use crate::quick_search::details::date;
+            self.state.dates.replace(Some([
+                format!("{}  {}",zsdesk_core::i18n::text("修改时间"),date(metadata.last_write_time())),
+                format!("{}  {}",zsdesk_core::i18n::text("创建时间"),date(metadata.creation_time())),
+            ]));
+        }
         *self.state.summary.borrow_mut() = if metadata.is_dir() { zsdesk_core::i18n::text("文件夹").into() }
             else { format!("{} · {}", file_type(path), zsdesk_ui::chrome::format_size(metadata.len())) };
         if metadata.is_dir() {
@@ -258,6 +274,8 @@ pub(super) struct PreviewSnapshot {
 impl Drop for QuickPreview { fn drop(&mut self) { self.close(); } }
 
 struct PreviewState {
+    dates:RefCell<Option<[String;2]>>,
+    activation: RefCell<Option<PathBuf>>, text_percent:Cell<u16>,
     hwnd: Cell<HWND>, path: RefCell<PathBuf>, summary: RefCell<String>, notice: RefCell<String>,
     content: RefCell<Content>, font: Cell<HFONT>, brush: Cell<HBRUSH>, colors:Cell<PreviewColors>,requested_dark:Cell<bool>,refreshing_theme:Cell<bool>,laying_out:Cell<bool>,
     allow_system_handler: bool,
@@ -315,15 +333,17 @@ impl Drop for SystemPreview {
 
 impl PreviewState {
     fn s(&self, value: i32) -> i32 { zsdesk_ui::chrome::scale(value, unsafe { GetDpiForWindow(self.hwnd.get()) }.max(96)) }
-    fn release_content(&self) { let old = self.content.replace(Content::Empty); drop(old); }
+    fn release_content(&self) { self.dates.take(); let old = self.content.replace(Content::Empty); drop(old); }
     fn handler(&self) -> Option<IPreviewHandler> {
         match &*self.content.borrow() { Content::Handler(preview) => Some(preview.handler.clone()), _ => None }
     }
+    fn date_line_height(&self)->i32 { self.s(20 * i32::from(self.text_percent.get()) / 100) }
     fn content_rect(&self) -> RECT {
         let mut rect = RECT::default();
         let _ = unsafe { GetClientRect(self.hwnd.get(), &mut rect) };
         let margin = self.s(12);
-        RECT { left: margin, top: self.s(54), right: (rect.right - margin).max(margin), bottom: (rect.bottom - self.s(32)).max(self.s(54)) }
+        let top = self.s(54) + if self.dates.borrow().is_some() { 2*self.date_line_height() } else { 0 };
+        RECT { left: margin, top, right: (rect.right - margin).max(margin), bottom: (rect.bottom - self.s(32)).max(top) }
     }
     fn invalidate(&self) {
         let hwnd = self.hwnd.get();
@@ -391,6 +411,7 @@ impl PreviewState {
         let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         if unsafe { SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, metrics.cbSize,
             Some((&mut metrics as *mut NONCLIENTMETRICSW).cast()), 0, GetDpiForWindow(self.hwnd.get()).max(96)) }.is_ok() {
+            metrics.lfMessageFont.lfHeight = metrics.lfMessageFont.lfHeight * i32::from(self.text_percent.get()) / 100;
             let next = unsafe { CreateFontIndirectW(&metrics.lfMessageFont) };
             if !next.0.is_null() {
                 let previous = self.font.replace(next);
@@ -429,6 +450,14 @@ impl PreviewState {
         let old_font = if !self.font.get().0.is_null() { Some(unsafe { SelectObject(dc, self.font.get().into()) }) } else { None };
         let mut header = RECT { left: self.s(12), top: self.s(10), right: client.right - self.s(12), bottom: self.s(42) };
         draw_text(dc, &self.summary.borrow(), &mut header, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if let Some(dates)=self.dates.borrow().as_ref() {
+            let height=self.date_line_height();
+            let mut row=RECT { left:header.left,right:header.right,top:header.bottom,bottom:header.bottom+height };
+            for line in dates {
+                draw_text(dc,line,&mut row,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+                row.top+=height;row.bottom+=height;
+            }
+        }
         let mut footer = RECT { left: self.s(12), top: (client.bottom - self.s(28)).max(0), right: client.right - self.s(12), bottom: client.bottom };
         draw_text(dc, if self.embedded{zsdesk_core::i18n::text("Alt+P 关闭预览窗格")}else{zsdesk_core::i18n::text("空格 / Esc 关闭")}, &mut footer, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
         let content = self.content_rect();
@@ -472,6 +501,35 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     unsafe { Rc::increment_strong_count(raw); }
     let state = unsafe { Rc::from_raw(raw) };
     match message {
+        WM_LBUTTONDBLCLK if state.embedded && matches!(&*state.content.borrow(), Content::Folder(_)) => {
+            state.activation.replace(Some(state.path.borrow().clone()));
+            LRESULT(0)
+        }
+        WM_NOTIFY if state.embedded && lp.0 != 0 => {
+            use windows::Win32::UI::Controls::*;
+            let h = unsafe { &*(lp.0 as *const NMHDR) };
+            if matches!(&*state.content.borrow(), Content::Folder(list) if list.0 == h.hwndFrom) {
+                let row = if h.code == NM_DBLCLK {
+                    let item = unsafe { &*(lp.0 as *const NMITEMACTIVATE) };
+                    Some(item.iItem)
+                } else if h.code == LVN_KEYDOWN && unsafe { (*(lp.0 as *const NMLVKEYDOWN)).wVKey } == 13 {
+                    crate::report_list::selected(h.hwndFrom).map(|i| i as i32)
+                } else { None };
+                if let Some(row) = row {
+                    let mut target = state.path.borrow().clone();
+                    if row >= 0 {
+                        let mut name = [0u16; 512];
+                        let mut item = LVITEMW { pszText: PWSTR(name.as_mut_ptr()), cchTextMax: name.len() as i32, ..Default::default() };
+                        let len = unsafe { SendMessageW(h.hwndFrom, LVM_GETITEMTEXTW, Some(WPARAM(row as usize)), Some(LPARAM(&mut item as *mut _ as isize))) }.0;
+                        if len <= 0 || len as usize >= name.len()-1 { return LRESULT(0); }
+                        use std::os::windows::ffi::OsStringExt;
+                        target.push(std::ffi::OsString::from_wide(&name[..len as usize]));
+                    }
+                    state.activation.replace(Some(target));
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEACTIVATE if state.hover => LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR if wp.0==hwnd.0 as usize && lp.0 as u16==HTCLIENT as u16=>{
             if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)}{unsafe{SetCursor(Some(cursor));}LRESULT(1)}

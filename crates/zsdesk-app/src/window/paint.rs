@@ -39,13 +39,14 @@ fn pixel_aligned_icon(rect: RectF) -> RectF {
 }
 
 /// Window-independent tab painting also used by the memory-raster regression.
-fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance){
+fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance,radius:Option<u8>){
     let Some(fill)=appearance.fill else{return;};let s=|value:f32|value*dpi as f32/96.0;
+    let corner = |default:f32| s(radius.map(f32::from).unwrap_or(default)).min(r.w*0.5).min(r.h*0.5);
     if let Some(border)=appearance.border{
         let card=RectF::new(r.x+s(1.0),r.y+s(1.0),(r.w-s(2.0)).max(0.0),(r.h-s(2.0)).max(0.0));
-        cv.round(card,s(6.0),c(fill));cv.stroke_round(card,s(6.0),c(border),s(1.0));
-    }else if vertical{cv.round(r,s(6.0),c(fill));}
-    else{cv.tab_shape(r,s(8.0),s(6.0),c(fill));}
+        cv.round(card,corner(6.0),c(fill));cv.stroke_round(card,corner(6.0),c(border),s(1.0));
+    }else if vertical{cv.round(r,corner(6.0),c(fill));}
+    else{cv.tab_shape(r,corner(8.0),corner(8.0).min(s(6.0)),c(fill));}
 }
 
 impl WindowState {
@@ -55,11 +56,26 @@ impl WindowState {
     /// Resolves (and caches) the small Shell icon for a location.
     fn icon_for(&mut self, location: &ShellLocation) -> Option<ID2D1Bitmap> {
         let px = self.s(ICON_DIP);
-        let key = format!("{px}|{}", location.address());
+        self.cached_icon(format!("{px}|{}", location.address()), |gfx| {
+            let icon = resolve_icon(location, px)?;
+            gfx.wic_from_icon(icon.0)
+        })
+    }
+
+    fn bookmark_category_icon(&mut self) -> Option<ID2D1Bitmap> {
+        let px = self.s(ICON_DIP);
+        self.cached_icon(format!("category:{px}"), |gfx| {
+            let index = icons::icon_index_for_name("folder", true)?;
+            let icon = icons::OwnedIcon(icons::system_icon(index, px)?);
+            gfx.white_folder_icon(icon.0)
+        })
+    }
+
+    fn cached_icon(&mut self, key: String, load: impl FnOnce(&Gfx) -> Option<IWICBitmapSource>) -> Option<ID2D1Bitmap> {
         let gfx = self.gfx.as_ref()?;
         let generation = gfx.generation();
         if !self.icons.contains_key(&key) {
-            let wic = resolve_icon(location, px).and_then(|icon| gfx.wic_from_icon(icon.0));
+            let wic = load(gfx);
             if self.icons.len() > 256 { self.icons.clear(); }
             self.icons.insert(key.clone(), IconEntry { wic, bitmap: None });
         }
@@ -73,6 +89,12 @@ impl WindowState {
     #[cfg(test)]
     pub(super) fn paint(&mut self) { self.paint_to(None); }
 
+    pub(super) fn release_idle_graphics(&mut self) {
+        self.surface=None;
+        for icon in self.icons.values_mut(){icon.bitmap=None;}
+        if let Some(gfx)=&self.gfx{gfx.release_device_resources();}
+    }
+
     pub(super) fn paint_update(&mut self,dc:HDC,dirty:RECT){self.paint_to(Some((dc,dirty)));}
 
     fn paint_to(&mut self,destination:Option<(HDC,RECT)>) {
@@ -82,9 +104,12 @@ impl WindowState {
         let client=RECT{left:0,top:0,right:width,bottom:height};
         let dirty=destination.map_or(client,|(_,r)|RECT{left:r.left.max(0),top:r.top.max(0),right:r.right.min(width),bottom:r.bottom.min(height)});
         if dirty.left>=dirty.right||dirty.top>=dirty.bottom{return;}
+        if destination.is_some_and(|(dc,_)|!unsafe{windows::Win32::Graphics::Gdi::RectVisible(dc,&dirty)}.as_bool()){
+            return;
+        }
         // The Shell child paints its own file list. Keep a short reusable DIB
         // for the surrounding chrome instead of backing the whole client twice.
-        let band_height=if destination.is_some(){height.min(96)}else{height};
+        let band_height=if destination.is_some(){height.min(64)}else{height};
         if Surface::ensure(&mut self.surface, width, band_height).is_none() { return; }
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.
         let damaged=|r:LayoutRect|!r.is_empty()&&r.x<dirty.right&&r.right()>dirty.left&&r.y<dirty.bottom&&r.bottom()>dirty.top;
@@ -98,7 +123,9 @@ impl WindowState {
         let bookmark_icons:Vec<_>=if damaged(self.layout.bookmarks_row){
             (0..self.layout.bookmarks.len()).map(|i|{
                 let index=self.bookmark_index(i)?;let b=&self.session.bookmarks[index];
-                if b.is_folder{return None;}let location=b.target.clone();self.icon_for(&location)
+                if b.is_folder { return self.bookmark_category_icon(); }
+                let location=b.target.clone();
+                self.icon_for(&location)
             }).collect()
         }else{Vec::new()};
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
@@ -163,17 +190,27 @@ impl WindowState {
             let title_end=if self.layout.tab_list.is_empty(){self.layout.app_menu.x}else{self.layout.tab_list.x};
             cv.text(&title,RectF::new(self.sf(14.0),strip.y,(title_end as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
         }
+        let style=self.session.ui.tab_style;
+        let custom_colors=(style.selected_color.is_some() || style.inactive_color.is_some()) && !zsdesk_windows::theme::high_contrast();
         for (n, slot) in self.layout.tabs.iter().enumerate() {
             let r = rf(slot.rect);
             if self.layout.vertical_tabs { cv.push_clip(r); }
             let is_active = slot.index == active;
-            let appearance=p.tab_appearance(is_active,self.active,self.session.ui.tab_selection_emphasis);
+            let mut appearance=p.tab_appearance(is_active,self.active,self.session.ui.tab_selection_emphasis);
+            if custom_colors {
+                if let Some(rgb)=if is_active {style.selected_color} else {style.inactive_color} {
+                    appearance=appearance.with_rgb(rgb);
+                }
+            }
             let text=c(appearance.text);
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.interface_dpi(),appearance);
-            } else if hovered {
-                cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
+                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.interface_dpi(),appearance,style.radius);
+            } else if hovered || appearance.fill.is_some() {
+                let face=RectF::new(r.x+self.sf(2.0),r.y+self.sf(2.0),r.w-self.sf(4.0),r.h-self.sf(6.0));
+                let radius=self.sf(f32::from(style.radius.unwrap_or(6).min(16))).min(face.h.max(0.0)*0.5);
+                if let Some(fill)=appearance.fill {cv.round(face,radius,c(fill));}
+                if hovered {cv.round(face,radius,c(p.hover));}
             } else {
                 // Separator unless the neighbour is active or hovered.
                 let next = self.layout.tabs.get(n + 1).map(|t| t.index);
@@ -349,23 +386,21 @@ impl WindowState {
             if enabled { self.button_fill(cv, *rect, hit, self.sf(4.0)); }
             let color = if enabled { c(p.text) } else { c(p.text_disabled) };
             let r = rf(*rect);
-            let g = match id {
-                CommandId::ExtractHere => "\u{E8B7}", CommandId::NewFolder => "\u{E8F4}",
-                CommandId::New => glyph::ADD, CommandId::Cut => glyph::CUT, CommandId::Copy => glyph::COPY,
-                CommandId::Paste => glyph::PASTE, CommandId::Rename => glyph::RENAME, CommandId::Share => glyph::SHARE,
-                CommandId::Delete => glyph::DELETE, CommandId::Sort => glyph::SORT, CommandId::View => glyph::VIEW,
-                CommandId::More => glyph::MORE, CommandId::DetailsPane => glyph::PROPERTIES, CommandId::PreviewPane => glyph::PREVIEW,
+            let draw_icon = |bounds:RectF| {
+                let side=self.sf(16.0).min(bounds.h).min(bounds.w);
+                let icon=RectF::new((bounds.x+(bounds.w-side)/2.).round(),(bounds.y+(bounds.h-side)/2.).round(),side,side);
+                let accent=if enabled {c(p.accent)} else {color};
+                zsdesk_windows::shell::menu::paint_command_icon(cv,icon,id.preference(),color,accent,c(p.layer));
             };
-            let glyph_color = if enabled && *id == CommandId::New { c(p.accent) } else { color };
             if l.compact_commands {
-                cv.glyph(g, r, self.sf(15.0), glyph_color);
+                draw_icon(r);
                 continue;
             }
             match id.label() {
-                None => cv.glyph(g, r, self.sf(15.0), glyph_color),
+                None => draw_icon(r),
                 Some(label) => {
                     let icon = RectF::new(r.x + self.sf(8.0), r.y, self.sf(20.0), r.h);
-                    cv.glyph(g, icon, self.sf(15.0), glyph_color);
+                    draw_icon(icon);
                     let right = if id.has_dropdown() { r.right() - self.sf(20.0) } else { r.right() - self.sf(6.0) };
                     let x = icon.right() + self.sf(6.0);
                     cv.text(label, RectF::new(x, r.y, right - x, r.h), &self.ui_style(), color);
@@ -395,8 +430,8 @@ impl WindowState {
         for (i, rect) in l.bookmarks.iter().enumerate() {
             let Some(index)=self.bookmark_index(i)else{continue;};
             if self.rename_id == Some(self.session.bookmarks[index].id) {
-                let r = rf(LayoutRect::new(rect.x, rect.y, if l.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))}, rect.height));
-                self.text_box(cv, r, true, false);
+                let width = if l.bookmarks_vertical { rect.width } else { rect.width.max(self.s(140)) };
+                self.text_box(cv, rf(LayoutRect::new(rect.x, rect.y, width, rect.height)), true, false);
                 continue;
             }
             self.button_fill(cv, *rect, Hit::Bookmark(i), self.sf(4.0));
@@ -410,9 +445,12 @@ impl WindowState {
             let r = rf(*rect);
             let icon = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(r.x + self.sf(8.0), r.y + (r.h - icon) / 2.0, icon, icon);
-            match icons.get(i) { Some(Some(b)) => cv.image(b, pixel_aligned_icon(icon_rect), 1.0), _ => cv.glyph(glyph::FOLDER, icon_rect, self.sf(14.0), c(p.text)) }
+            match icons.get(i) {
+                Some(Some(icon)) => cv.image(icon, pixel_aligned_icon(icon_rect), 1.0),
+                _ => cv.glyph(glyph::FOLDER, icon_rect, self.sf(14.0), c(p.text)),
+            }
             let x = icon_rect.right() + self.sf(6.0);
-            cv.text(&self.bookmark_label(index), RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
+            cv.text(&self.session.bookmarks[index].display_name, RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
@@ -536,14 +574,16 @@ impl WindowState {
         self.bookmark_order=if !self.session.ui.show_bookmarks || self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{Vec::new()}
             else if self.session.ui.bookmark_display==BookmarkDisplay::Categories{self.session.bookmarks.iter().enumerate().filter_map(|(i,b)|b.parent_id.is_none().then_some(i)).collect()}
             else{self.session.visible_bookmarks()};
-        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(gfx) = &self.gfx else { self.bookmark_widths.clear(); return; };
         let style = self.ui_style();
-        let extra = self.s(8) + self.s(ICON_DIP) + self.s(6) + self.s(10);
-        if self.session.ui.show_bookmarks && self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{
-            self.bookmark_widths=vec![(gfx.measure(zsdesk_core::i18n::text("收藏夹"),&style,600.0).0 as i32+extra).min(self.s(220))];return;
-        }
-        self.bookmark_widths = self.bookmark_order.iter().map(|&index|
-            (gfx.measure(&self.bookmark_label(index), &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
+        let padding = self.s(8) + self.s(ICON_DIP) + self.s(6) + self.s(10);
+        let max_width = self.s(220);
+        let width = |label: &str| (gfx.measure(label, &style, 600.0).0 as i32 + padding).min(max_width);
+        self.bookmark_widths = if self.session.ui.show_bookmarks && self.session.ui.bookmark_display == BookmarkDisplay::Dropdown {
+            vec![width(zsdesk_core::i18n::text("收藏夹"))]
+        } else {
+            self.bookmark_order.iter().map(|&i| width(&self.session.bookmarks[i].display_name)).collect()
+        };
     }
 }
 
@@ -598,6 +638,76 @@ fn resolve_icon(location: &ShellLocation, px: i32) -> Option<icons::OwnedIcon> {
     }
     let pidl = pidl::location_pidl(location)?;
     icons::pidl_icon(&pidl, px)
+}
+
+#[cfg(test)]
+#[test]
+fn bookmark_presentation_sizes_each_visible_label_at_each_scale() {
+    use zsdesk_core::model::explorer::{Bookmark, BookmarkDisplay};
+    unsafe { OleInitialize(None) }.unwrap();
+    struct Apartment;
+    impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize(); } } }
+    let _apartment = Apartment;
+    let mut session = ExplorerSession::default();
+    session.ui.show_bookmarks = true;
+    session.bookmarks = vec![
+        Bookmark::link(1, "扫描".into(), ShellLocation::ThisPc, None),
+        Bookmark::folder(2, "工程分类".into(), None),
+        Bookmark::link(3, "工程文件".repeat(20), ShellLocation::ThisPc, Some(2)),
+    ];
+    let mut state = WindowState::new(session, std::env::temp_dir().join("zsdesk-bookmark-test.json"), None, false);
+    state.gfx = Some(Gfx::new("Segoe UI").unwrap());
+    for dpi in [96, 120, 144, 192] {
+        state.dpi = dpi;
+        state.session.ui.bookmark_display = BookmarkDisplay::Expanded;
+        state.measure_bookmarks();
+        let expanded = state.bookmark_widths.clone();
+        assert_eq!(expanded.len(), 3);
+        assert!(expanded[0] < expanded[1] && expanded[1] < expanded[2]);
+        assert_eq!(expanded[2], state.s(220));
+
+        state.session.ui.bookmark_display = BookmarkDisplay::Categories;
+        state.measure_bookmarks();
+        assert_eq!(state.bookmark_widths, expanded[..2]);
+
+        state.session.ui.bookmark_display = BookmarkDisplay::Dropdown;
+        state.measure_bookmarks();
+        let label = zsdesk_core::i18n::text("收藏夹");
+        let text_width = state.gfx.as_ref().unwrap().measure(label, &state.ui_style(), 600.0).0 as i32;
+        let padding = state.s(8) + state.s(16) + state.s(6) + state.s(10);
+        assert_eq!(state.bookmark_widths, vec![(text_width + padding).min(state.s(220))]);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bookmark_presentation_white_folder_retains_shell_shape_and_shading() {
+    unsafe { OleInitialize(None) }.unwrap();
+    struct Apartment;
+    impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize(); } } }
+    let _apartment=Apartment;
+    let gfx=Gfx::new("Segoe UI").unwrap();
+    let index=icons::icon_index_for_name("folder",true).unwrap();
+    for px in [16,24,32] {
+        let icon=icons::OwnedIcon(icons::system_icon(index,px).unwrap());
+        let source=gfx.wic_from_icon(icon.0).unwrap();
+        let white=gfx.white_folder_icon(icon.0).unwrap();
+        let (w,h)=Gfx::wic_size(&source);
+        assert_eq!(Gfx::wic_size(&white),(w,h));
+        let read=|s:&IWICBitmapSource| {
+            let mut pixels=vec![0;(w*h*4) as usize];
+            unsafe { s.CopyPixels(std::ptr::null(),w*4,&mut pixels) }.unwrap();
+            pixels
+        };
+        let original=read(&source);
+        let recolored=read(&white);
+        for (a,b) in original.chunks_exact(4).zip(recolored.chunks_exact(4)) {
+            assert_eq!(a[3],b[3]);
+            assert!(b[0]==b[1] && b[1]==b[2] && b[2]<=b[3]);
+        }
+        assert!(recolored.chunks_exact(4).any(|b| b[3] > 240 && b[0] > 240));
+        assert!(recolored.chunks_exact(4).any(|b| b[3] > 128 && b[0] < b[3]-25));
+    }
 }
 
 #[cfg(test)]

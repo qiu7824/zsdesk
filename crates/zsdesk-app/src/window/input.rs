@@ -572,8 +572,25 @@ impl WindowState {
             extensions, hidden,
         };
         let anchor = self.layout.command_rect(CommandId::View);
-        let choice = popup(self.hwnd, &menus::view_menu(mode, icon, show), anchor);
+        let mut menu = menus::view_menu(mode, icon, show);
+        if mode == 4 && !self.columns.active {
+            if let Some((modified,created)) = self.browser.as_ref().and_then(|b| b.date_columns()) {
+                menu.items.push(menus::submenu(zsdesk_core::i18n::text("详细信息列"), vec![
+                    menus::entry(zsdesk_core::i18n::text("修改时间"),"column-modified",true,modified),
+                    menus::entry(zsdesk_core::i18n::text("创建时间"),"column-created",true,created),
+                ]));
+            }
+        }
+        let choice = popup(self.hwnd, &menu, anchor);
         match choice.as_deref() {
+            Some(id @ ("column-modified" | "column-created")) => {
+                if let Some(browser) = &self.browser {
+                    match browser.toggle_date_column(id=="column-created") {
+                        Ok(()) => { unsafe { self.capture_active(); } self.save(); },
+                        Err(error) => self.show_message(error.to_string()),
+                    }
+                }
+            }
             Some("show-nav") => {
                 self.session.ui.show_tree = !show.navigation;self.rebuild_navigation_tree();self.save();unsafe{self.resize();}
                 // A hidden tree is not synced while navigating; catch up when shown again.
@@ -740,7 +757,7 @@ impl WindowState {
             }
             return true;
         }
-        if id.starts_with("appearance-") { if crate::edition::THEMED { self.apply_appearance_choice(id); } return true; }
+        if id.starts_with("appearance-") { if crate::edition::THEMED || id.starts_with("appearance-color-") { self.apply_appearance_choice(id); } return true; }
         if id=="integration-file-dialog-takeover" {
             self.toggle_file_dialog_takeover();return true;
         }
@@ -758,7 +775,7 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.right_click_close_tab=saved.ui.right_click_close_tab;self.session.ui.startup_location=saved.ui.startup_location;
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.tab_style=saved.ui.tab_style;self.session.ui.navigation_show_libraries=saved.ui.navigation_show_libraries;self.session.ui.right_click_close_tab=saved.ui.right_click_close_tab;self.session.ui.startup_location=saved.ui.startup_location;
             self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
             self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
             self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
@@ -814,17 +831,25 @@ impl WindowState {
                     _=>{let Some(path)=zsdesk_windows::desktop::pick_folder(self.hwnd,zsdesk_core::i18n::text("选择新标签页打开的文件夹"))else{return;};NewTabLocation::Folder(path)}};
                 match storage::save_new_tab_location(&self.config_path,&location){Ok(())=>{self.session.ui.new_tab_location=location;self.show_message(zsdesk_core::i18n::text("新标签页位置已保存").into());},Err(error)=>self.show_message(zsdesk_core::tr_format!("新标签页位置未保存：{error}", error=error))}
             },
+            Some(id @ ("tab-color-selected" | "tab-color-inactive")) => self.apply_interface_choice(id),
             Some("search-rebuild-index") => self.rebuild_search_index(),
             Some("dual-pane") => self.toggle_dual_pane(),
             Some(id) if self.search_engine_menu_action(id) => {},
-            Some("search-everything-program") => {
-                if self.session.ui.search_backend.is_builtin(){return;}
-                match crate::fast_search::everything::choose_executable(self.hwnd){
-                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;if self.persist_search_preferences(){self.search_backend_changed();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}}},
+            Some(id @ ("search-backend-everything"|"search-everything-program")) => {
+                let saved=self.session.ui.everything_executable.as_deref();
+                let choice=if id=="search-backend-everything" && crate::fast_search::everything::available(saved){
+                    Ok(self.session.ui.everything_executable.clone())
+                }else{crate::fast_search::everything::choose_executable(self.hwnd)};
+                match choice{
+                    Ok(Some(path))=>{
+                        self.session.ui.everything_executable=Some(path);
+                        self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;
+                        if self.persist_search_preferences(){self.search_backend_changed();}
+                    }
                     Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
-            Some(id) if id.starts_with("appearance-") => if crate::edition::THEMED { self.apply_appearance_choice(id); },
+            Some(id) if id.starts_with("appearance-") => if crate::edition::THEMED || id.starts_with("appearance-color-") { self.apply_appearance_choice(id); },
             Some(id) if id.starts_with("context-menu-") || id.starts_with("context-action-") => {
                 if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,id){
                     if !self.persist_context_menu(){return;}
@@ -898,11 +923,56 @@ impl WindowState {
         let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
     }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
+        if id.starts_with("navigation-libraries-") {
+            match storage::update_shared_ui(&self.config_path,|ui| {
+                menus::apply_interface_setting(ui,id);
+                ui.navigation_show_libraries
+            }) {
+                Ok(preference)=>{
+                    self.session.ui.navigation_show_libraries=preference;
+                    self.rebuild_navigation_tree();self.publish_input_preferences();
+                }
+                Err(error)=>self.show_message(error.to_string()),
+            }
+            return;
+        }
+        if id.starts_with("tab-radius-") || id.starts_with("tab-color-") {
+            let mut color=None;
+            if matches!(id,"tab-color-selected"|"tab-color-inactive") {
+                use windows_sys::Win32::UI::Controls::Dialogs::{ChooseColorW,CHOOSECOLORW,CC_FULLOPEN,CC_RGBINIT};
+                let selected=id=="tab-color-selected";
+                let rgb=if selected {self.session.ui.tab_style.selected_color} else {self.session.ui.tab_style.inactive_color};
+                let base=if selected {self.palette.layer} else {self.palette.strip};
+                let [r,g,b]=rgb.unwrap_or([base.r,base.g,base.b]);
+                let mut custom=[0xffffffu32;16];
+                let mut dialog:CHOOSECOLORW=unsafe{std::mem::zeroed()};
+                dialog.lStructSize=std::mem::size_of_val(&dialog) as u32;
+                dialog.hwndOwner=self.hwnd.0;
+                dialog.rgbResult=u32::from_le_bytes([r,g,b,0]);
+                dialog.lpCustColors=custom.as_mut_ptr();
+                dialog.Flags=CC_FULLOPEN|CC_RGBINIT;
+                if unsafe{ChooseColorW(&mut dialog)}==0 {return;}
+                let [r,g,b,_]=dialog.rgbResult.to_le_bytes();
+                color=Some([r,g,b]);
+            }
+            match storage::update_shared_ui(&self.config_path,|ui|{
+                match id {
+                    "tab-color-selected"=>ui.tab_style.selected_color=color,
+                    "tab-color-inactive"=>ui.tab_style.inactive_color=color,
+                    _=>{menus::apply_interface_setting(ui,id);}
+                }
+                ui.tab_style
+            }) {
+                Ok(style)=>{self.session.ui.tab_style=style;self.invalidate();self.publish_input_preferences();}
+                Err(e)=>self.show_message(e.to_string()),
+            }
+            return;
+        }
         if id.starts_with("bookmarks-display-")||id.starts_with("navigation-divider-")||id.starts_with("interface-text-"){
             match storage::update_shared_ui(&self.config_path,|ui|{menus::apply_interface_setting(ui,id);(ui.bookmark_display,ui.navigation_divider,ui.interface_text_percent)}){
                 Ok((display,divider,percent))=>{
                     unsafe{self.commit_bookmark_rename();}self.session.ui.bookmark_display=display;self.session.ui.navigation_divider=divider;
-                    if self.session.ui.interface_text_percent!=percent{self.session.ui.interface_text_percent=percent;unsafe{self.update_font();}self.crumbs_for=None;}
+                    if self.session.ui.interface_text_percent!=percent{self.set_text_percent(percent);}
                     self.measure_bookmarks();unsafe{self.resize();}self.invalidate();self.publish_input_preferences();
                 },
                 Err(e)=>self.show_message(zsdesk_core::tr_format!("保存会话失败：{e}",e=e)),
@@ -945,7 +1015,7 @@ impl WindowState {
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
         if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
-        if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-auto")&&!self.persist_search_preferences(){return;}
+        if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-clear")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
         if id=="interface-navigation" || id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
         self.crumbs_for=None;
@@ -960,7 +1030,7 @@ impl WindowState {
         if id=="explorer-tray"{crate::runtime::refresh_tray();}
         self.measure_bookmarks();self.relayout();self.position_children();
         if id=="everything-folder-sizes" {self.poll_folder_sizes();}
-        if id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="search-everything-auto"{self.search_backend_changed();}
+        if id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="search-everything-clear"{self.search_backend_changed();}
         if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
             if let Some(tree)=&self.tree {
                 let location=self.current_location();
@@ -974,8 +1044,7 @@ impl WindowState {
     fn search_engine_menu_action(&mut self, id: &str) -> bool {
         match id {
             "search-engine-status"=>{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}},
-            "search-index-settings" => self.launch_search_settings(false),
-            "search-everything-service" => self.launch_search_settings(true),
+            "search-index-settings" => self.launch_search_settings(),
             _ => return false,
         };
         true

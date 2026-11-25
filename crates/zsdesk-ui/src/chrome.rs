@@ -154,7 +154,7 @@ impl SearchPanelLayout {
         panel.submit = Rect::clamped(panel.query.right() - s(32), y + s(3), s(30), s(32));
         y += s(48);
         let mut cx = x;
-        for dip_width in [52, 68, 56, 56, 56, 56] {
+        for dip_width in [52, 68, 56, 56, 56, 56, 56] {
             let chip_width = s(dip_width).min(inner);
             if cx > x && cx + chip_width > right { cx = x; y += s(34); }
             panel.categories.push(Rect::clamped(cx, y, chip_width, s(28)));
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn expanded_search_wraps_filters_in_a_constrained_content_region() {
         let panel = SearchPanelLayout::new(340, 0, 96);
-        assert_eq!(panel.categories.len(), 6);
+        assert_eq!(panel.categories.len(), 7);
         assert!(panel.categories.last().unwrap().y > panel.categories[0].y);
         assert!(panel.previous.y > panel.index_settings.y);
         assert!(panel.categories.iter().all(|chip| chip.x >= panel.card.x && chip.right() <= panel.card.right()));

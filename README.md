@@ -4,7 +4,7 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/qiu7824/zsdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.4.3**，支持简体中文和英文界面。
+适用于 Windows 10 1809（17763）及以上的 64 位 Windows。当前版本为 **0.4.7**，支持简体中文和英文界面。
 
 English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
@@ -19,7 +19,7 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 主题版 | 全量功能，增加 Mica、亚克力和深浅色材质，配置独立 |
 | 桌面盒子独立版 | 只整理桌面，不包含文件管理窗口与搜索 |
 
-每个版本提供安装程序和便携 ZIP。普通用户选择名称含 `setup.exe` 的安装程序；便携版解压后运行 `ZSDesk.exe`，保留整个程序目录和 `data` 配置目录。
+全量版提供小于 5 MB 的完整离线安装包（-full-x64-offline-setup.exe），可安装到空目录。每个版本提供安装程序和便携 ZIP。普通用户选择名称含 `setup.exe` 的安装程序；便携版解压后运行 `ZSDesk.exe`，保留整个程序目录和 `data` 配置目录。
 
 ## 开始使用
 
@@ -51,7 +51,7 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 
 ## 搜索、预览和右键
 
-- **搜索**：可选择自带搜索或 Everything；网络共享及已有映射网络目录使用限定目录遍历搜索。首次建立本地索引需要时间，可在搜索设置中查看引擎、索引就绪状态和范围。
+- **搜索**：默认自带搜索，用户可手动选择自己安装的 Everything.exe；网络共享及已有映射网络目录使用限定目录遍历搜索。首次建立本地索引需要时间，可在搜索设置中查看引擎、索引就绪状态和范围。
 - **预览**：内置预览与 QuickLook 可选择。Office 文档预览需要相应的已安装组件；图片、音视频格式取决于系统解码器。
 - **右键**：支持经典系统菜单和 Windows 11 样式。Windows 11 样式按对象显示常用操作，可勾选首屏应用扩展。Shift+右键可直接使用经典菜单。
 - **Listary**：安装和连接方式见[详细使用说明](docs/user-guide.md)及 `integrations/listary`。

@@ -340,6 +340,14 @@ impl NavigationDivider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TabStyle {
+    pub radius: Option<u8>,
+    pub selected_color: Option<[u8;3]>,
+    pub inactive_color: Option<[u8;3]>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
@@ -364,6 +372,7 @@ pub struct ExplorerUi {
     pub show_tab_list: bool,
     /// Opt-in stronger selected-tab appearance; legacy profiles keep the existing style.
     pub tab_selection_emphasis: bool,
+    pub tab_style: TabStyle,
     pub mouse_gestures: bool,
     /// Show view-local totals; native calculation is available without an index.
     pub everything_folder_sizes: bool,
@@ -401,6 +410,7 @@ pub struct ExplorerUi {
     pub file_dialog_takeover: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
+    pub navigation_show_libraries: Option<bool>,
     pub navigation_show_recycle_bin: bool,
     pub navigation_show_network: bool,
     pub navigation_expand_this_pc: Option<bool>,
@@ -430,7 +440,7 @@ impl Default for ExplorerUi {
     fn default() -> Self {
         Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, folder_layouts:Default::default(), pane_ratio:500,
             double_click_close_tab:true, right_click_close_tab:false, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
+            close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,tab_style:TabStyle::default(),
             show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false,bookmark_display:BookmarkDisplay::default(),navigation_divider:NavigationDivider::default(),interface_text_percent:100, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
@@ -440,7 +450,7 @@ impl Default for ExplorerUi {
             forward_unhandled_windows: true,
             forward_while_running: false,
             file_dialog_takeover: true,
-            navigation_auto_expand: None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
+            navigation_auto_expand: None,navigation_show_libraries:None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
             appearance: AppearancePreferences::default(),
             window: None }
     }

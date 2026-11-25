@@ -20,24 +20,27 @@ pub(super) enum SearchCategory {
     Images,
     Videos,
     Audio,
+    Other,
 }
 
 impl SearchCategory {
-    pub(super) const ALL: [Self; 6] = [Self::All, Self::Folders, Self::Documents, Self::Images, Self::Videos, Self::Audio];
+    pub(super) const ALL: [Self; 7] = [Self::All, Self::Folders, Self::Documents, Self::Images, Self::Videos, Self::Audio, Self::Other];
 
     pub(super) fn query_prefix(&self) -> &'static str {
         match self {
             Self::All => "",
+            Self::Other => crate::fast_search::file_types::OTHER,
             Self::Folders => "folder:",
-            Self::Documents => "ext:doc;docx;docm;xls;xlsx;xlsm;ppt;pptx;pptm;pdf;txt;rtf;md;csv;odt;ods;odp;wps;et;dps",
-            Self::Images => "ext:jpg;jpeg;png;gif;bmp;webp;heic;heif;avif;tif;tiff;svg;ico;raw;cr2;nef;arw;psd",
-            Self::Videos => "ext:mp4;mkv;avi;mov;wmv;flv;webm;m4v;mpg;mpeg;ts;m2ts;3gp",
-            Self::Audio => "ext:mp3;wav;flac;aac;m4a;ogg;opus;wma;aiff;ape;alac;mid;midi",
+            Self::Documents => crate::fast_search::file_types::DOCUMENTS,
+            Self::Images => crate::fast_search::file_types::IMAGES,
+            Self::Videos => crate::fast_search::file_types::VIDEOS,
+            Self::Audio => crate::fast_search::file_types::AUDIO,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Other => zsdesk_core::i18n::text("其他"),
             Self::All => zsdesk_core::i18n::text("全部"), Self::Folders => zsdesk_core::i18n::text("文件夹"), Self::Documents => zsdesk_core::i18n::text("文档"),
             Self::Images => zsdesk_core::i18n::text("图片"), Self::Videos => zsdesk_core::i18n::text("视频"), Self::Audio => zsdesk_core::i18n::text("音频"),
         }
@@ -268,7 +271,7 @@ impl WindowState {
                 if controls.error.is_some() && !controls.busy { unsafe { self.request_integrated_search(true); } }
             }
             SearchPanelHit::IndexSettings => {
-                self.launch_search_settings(false);
+                self.launch_search_settings();
             }
         }
         self.invalidate();

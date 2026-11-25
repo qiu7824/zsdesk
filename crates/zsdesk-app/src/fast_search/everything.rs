@@ -33,16 +33,11 @@ pub struct SearchItem{
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub struct SearchPage{pub items:Vec<SearchItem>,pub total:u64,pub offset:u32}
 
-pub fn running()->Option<HWND>{runtime::running()}
 pub fn available(configured:Option<&Path>)->bool{runtime::available(configured)}
-pub fn executable(configured:Option<&Path>)->Option<PathBuf>{runtime::executable(configured)}
 /// Observes configured/running sources without launching an indexer or service.
 /// Run on a background worker because bounded IPC and file checks may wait.
 pub fn status_report(profile:&Path)->String{runtime::status_report(profile)}
-pub fn open_settings(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::open_settings(profile)}
-/// Must be invoked only by the explicit “启用全盘索引” user action.
-pub fn enable_service(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::enable_service(profile)}
-pub fn shutdown_managed_if_unused()->Result<()>{runtime::shutdown_managed_if_unused()}
+pub fn open_settings(profile:&Path)->Result<()>{super::require_everything(profile)?;runtime::open_settings(profile)}
 
 pub fn choose_executable(owner:HWND)->Result<Option<PathBuf>>{
     use windows::Win32::System::Com::{CoCreateInstance,CLSCTX_INPROC_SERVER,CoTaskMemFree};
@@ -101,7 +96,7 @@ fn decode_page(bytes:&[u8],options:&QueryOptions)->Result<SearchPage>{
 }
 fn validate(options:&QueryOptions)->Result<()>{
     ensure!(!options.text.contains('\0'),"搜索内容包含无效字符");
-    ensure!(options.text.chars().count()<=512,"搜索内容过长，请缩短关键词");
+    ensure!(options.text.chars().count()<=super::MAX_EXPRESSION_CHARS,"搜索内容过长，请缩短关键词");
     ensure!((1..=PAGE_LIMIT).contains(&options.limit),"搜索页大小无效");
     ensure!(options.offset.checked_add(options.limit).is_some(),"搜索分页超出范围");Ok(())
 }
@@ -117,7 +112,7 @@ fn query_packet_with_search_flags(options:&QueryOptions,hwnd:HWND,cookie:u32,fla
 }
 fn query_with_progress(options:&QueryOptions,cookie:u32,configured:Option<&Path>,cancel:impl Fn()->bool,flags:u32,pending:&mut dyn FnMut())->Result<SearchPage>{
     validate(options)?;if cancel(){bail!("搜索已取消");}
-    let server=runtime::ensure_running(configured,&cancel,false)?;runtime::wait_ready(&server,&cancel,pending)?;
+    let server=runtime::ensure_running(configured,&cancel)?;runtime::wait_ready(&server,&cancel,pending)?;
     query_connection(options,cookie,&server,cancel,flags,0)
 }
 fn query_connection(options:&QueryOptions,cookie:u32,server:&runtime::Connection,cancel:impl Fn()->bool,flags:u32,search_flags:u32)->Result<SearchPage>{
@@ -146,7 +141,7 @@ fn query_connection(options:&QueryOptions,cookie:u32,server:&runtime::Connection
     }
 }
 pub fn query_page(profile:&Path,options:&QueryOptions,cookie:u32,cancel:impl Fn()->bool)->Result<SearchPage>{
-    let _activity=super::everything_activity();super::require_everything(profile)?;
+    super::require_everything(profile)?;
     query_with(options,cookie,runtime::configured(profile).as_deref(),cancel)
 }
 
@@ -154,13 +149,13 @@ pub fn query_page(profile:&Path,options:&QueryOptions,cookie:u32,cancel:impl Fn(
 /// This never requests a filesystem scan, enables an index, or treats a missing
 /// index entry as a zero-byte folder. Call only from a cancellable worker.
 pub(crate) fn query_folder_sizes(profile:&Path,paths:&[PathBuf],cookie:u32,cancel:impl Fn()->bool)->Result<Vec<(PathBuf,Option<u64>)>> {
-    let _activity=super::everything_activity();super::require_everything(profile)?;
+    super::require_everything(profile)?;
     ensure!(paths.len()<=64,"一次最多查询 64 个可见文件夹");
     if paths.is_empty(){return Ok(Vec::new());}
     if cancel(){bail!("文件夹大小查询已取消");}
     let started=Instant::now();
     let cancelled=||cancel()||started.elapsed()>Duration::from_secs(8);
-    let server=runtime::ensure_running(runtime::configured(profile).as_deref(),&cancelled,false)?;
+    let server=runtime::ensure_running(runtime::configured(profile).as_deref(),&cancelled)?;
     if cancelled(){bail!("文件夹大小查询已取消或超时");}
     ensure!(runtime::ipc(server.hwnd,401,0)?!=0,"Everything 索引尚未就绪");
     // Official Everything SDK: WM_USER/411, FILE_INFO_FOLDER_SIZE=2.
@@ -211,7 +206,6 @@ fn folder_size_literal(path:&Path)->Option<String>{
     Ok((page.items.into_iter().map(|item|item.path).collect(),page.total,truncated))
 }
 pub(super) fn execute(shared:&Shared,sender:&SyncSender<SearchEvent>,request:&Request,profile:&Path,configured:Option<PathBuf>){
-        let _activity=super::everything_activity();
         if let Err(error)=super::require_everything(profile){emit(shared,sender,failure(request.generation,BackendKind::Everything,error.to_string()));return;}
         let options=QueryOptions{text:request.query.clone(),offset:request.offset,limit:request.limit,sort:request.sort};
         let mut pending=||{

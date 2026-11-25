@@ -369,6 +369,8 @@ pub struct FenceWin {
     pub tracking: bool,
     /// A collapsed fence temporarily rolled down under the pointer.
     pub peek: bool,
+    /// Keep a manually expanded fence above ordinary windows during this interaction.
+    pub raised_on_expand: bool,
     pub title_bottom:bool,
     /// Explicitly collapsed under the pointer: no peek until it leaves.
     pub peek_blocked: bool,
@@ -394,7 +396,7 @@ impl FenceWin {
     pub fn new(id: u64) -> Self {
         let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), menu_highlight: None, anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
-            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, title_bottom:false, peek_blocked: false,
+            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, raised_on_expand:false, title_bottom:false, peek_blocked: false,
             tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None };
         value.advance_operation_epoch();value
     }

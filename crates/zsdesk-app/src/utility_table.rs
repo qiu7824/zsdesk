@@ -10,6 +10,7 @@ const SUBCLASS: usize = 0x5a54;
 pub(super) struct Metadata {
     pub size: String,
     pub modified: String,
+    pub created: String,
     pub icon: i32,
 }
 
@@ -26,13 +27,13 @@ impl Row {
             .to_string_lossy()
             .into_owned();
         let parent = path.parent().unwrap_or(path).to_string_lossy().into_owned();
-        let (size, modified, icon) = meta.map_or_else(
-            || ("…".to_owned(), "…".to_owned(), I_IMAGENONE),
-            |m| (m.size.clone(), m.modified.clone(), m.icon),
+        let (size, modified, created, icon) = meta.map_or_else(
+            || ("…".to_owned(), "…".to_owned(), "…".to_owned(), I_IMAGENONE),
+            |m| (m.size.clone(), m.modified.clone(), m.created.clone(), m.icon),
         );
         Self {
             path: path.into(),
-            cells: ZsTableRow::new(index as u64, [name, parent, size, modified]),
+            cells: ZsTableRow::new(index as u64, [name, parent, size, modified, created]),
             icon,
         }
     }
@@ -126,7 +127,7 @@ impl Table {
                 r.path == path
                     && (r.icon != value.icon
                         || r.cells.cell(2) != value.size
-                        || r.cells.cell(3) != value.modified)
+                        || r.cells.cell(3) != value.modified || r.cells.cell(4) != value.created)
             });
         if change {
             model.rows[row] = Row::new(row, path, Some(&value));
@@ -192,7 +193,7 @@ impl Table {
             return true;
         }
         let dpi=self.render_dpi.get().max(96);
-        let widths: [i32; 4] = std::array::from_fn(
+        let widths: [i32; 5] = std::array::from_fn(
             |i| unsafe { SendMessageW(hwnd, LVM_GETCOLUMNWIDTH, Some(WPARAM(i)), None) }.0 as i32,
         );
         let columns: Vec<_> = widths
@@ -582,11 +583,13 @@ mod tests {
         let meta = Metadata {
             size: "42 KB".into(),
             modified: "2026-11-23".into(),
+            created: "2026-11-21".into(),
             icon: 7,
         };
         model.put(&path, meta);
         model.replace(&[PathBuf::from(r"C:\目录"), path]);
         assert_eq!(model.rows[1].cells.cell(2), "42 KB");
+        assert_eq!(model.rows[1].cells.cell(4), "2026-11-21");
         assert_eq!(model.rows[1].icon, 7);
     }
 }

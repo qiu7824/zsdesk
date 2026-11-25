@@ -8,12 +8,6 @@ See ZSUI-MPL-2.0.txt.
 
 Native menu interface declarations: MIT; see Native-menu-MIT.txt.
 
-Everything 1.4.1.1032 x64 (standard, non-Lite): Copyright (C) 2018 David Carpenter.
-Official distribution: https://www.voidtools.com/Everything-1.4.1.1032.x64.zip
-The original executable and language pack are redistributed without modification.
-The complete Everything and Perl-Compatible Regular Expressions notices are
-included in Everything-1.4.1.1032-License.txt and engines/everything/License.txt.
-
 Layout migration dependencies (MIT): roxmltree 0.21.1, sha2 0.10.9,
 digest 0.10.7, block-buffer 0.10.4, crypto-common 0.1.7,
 generic-array 0.14.7, typenum 1.20.1, cpufeatures 0.2.17,

@@ -39,6 +39,10 @@
 #error The executable or verified package manifest is missing
 #endif
 
+#if FileExists(SourceDir + "\engines\everything\Everything.exe")
+#error Everything must be supplied separately by the user
+#endif
+
 [Setup]
 AppId={#ProductAppId}
 AppName={#ProductName}
@@ -69,7 +73,7 @@ WizardResizable=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0.18362
+MinVersion=10.0.17763
 SetupIconFile=..\..\crates\zsdesk-app\resources\zsdesk.ico
 UninstallDisplayIcon={app}\ZSDesk.exe
 CloseApplications=yes
@@ -96,11 +100,7 @@ Source: "{#SourceDir}\ZSDesk.exe"; DestName: "ZSDesk-update-helper.exe"; Flags: 
 Source: "{#SourceDir}\msvcp140.dll"; Flags: dontcopy
 Source: "{#SourceDir}\vcruntime140.dll"; Flags: dontcopy
 Source: "{#SourceDir}\vcruntime140_1.dll"; Flags: dontcopy
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "ZSDeskWindowHook-*.dll,\engines\everything\Everything.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
-#if FileExists(SourceDir + "\engines\everything\Everything.exe")
-#define EngineHash GetSHA256OfFile(SourceDir + "\engines\everything\Everything.exe")
-Source: "{#SourceDir}\engines\everything\Everything.exe"; DestDir: "{app}\engines\everything"; Flags: ignoreversion; Check: NeedsSearchEngine
-#endif
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "ZSDeskWindowHook-*.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\ZSDeskWindowHook-*.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
@@ -189,20 +189,6 @@ var
   LoginFolder: String;
   OriginalLogin: Integer;
   HelperReady: Boolean;
-
-#ifdef EngineHash
-function NeedsSearchEngine: Boolean;
-var
-  Target: String;
-begin
-  Target := ExpandConstant('{app}\engines\everything\Everything.exe');
-  Result := True;
-  if FileExists(Target) then begin
-    Result := CompareText(GetSHA256OfFile(Target), '{#EngineHash}') <> 0;
-    if not Result then Log('Keeping the identical Everything service executable.');
-  end;
-end;
-#endif
 
 procedure ExtractUpdateHelper;
 begin

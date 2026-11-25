@@ -505,6 +505,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_TIMER => {
             let done = with_host(|h| {
+                if wp.0 == protocol::HostTimer::PaintIdle as usize {
+                    let _=unsafe{KillTimer(Some(hwnd),wp.0)};
+                    h.release_idle_graphics();
+                }
                 if wp.0 == TIMER_SAVE { h.save_now(); }
                 if wp.0 == TIMER_DESKTOP { let _ = unsafe { KillTimer(Some(h.hwnd), TIMER_DESKTOP) }; h.refresh_desktop(); }
                 if wp.0 == TIMER_ICONS { let _ = unsafe { KillTimer(Some(h.hwnd), TIMER_ICONS) }; h.icons_ready(); }

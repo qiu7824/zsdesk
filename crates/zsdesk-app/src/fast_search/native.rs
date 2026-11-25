@@ -86,7 +86,11 @@ impl Store{
             if self.path.is_file(){progress(shared,sender,&self.path,0,IndexPhase::Snapshot,false);}
             match snapshot::load(&self.path,&policy(options),&||shared.cancelled()||!shared.current(generation)){
                 Ok(volumes)=>self.volumes=Some(volumes),
-                Err(error)=>{if shared.cancelled()||!shared.current(generation){return Err(error);}if self.path.is_file(){crate::window::diagnostics::record("search",&format!("native-snapshot-load-failed: {error:#}"),None);}}
+                Err(error)=>{
+                    if shared.cancelled()||!shared.current(generation){return Err(error);}
+                    if error.is::<snapshot::PolicyChanged>() {crate::window::diagnostics::record("search","native-snapshot-policy-changed",None);}
+                    else if self.path.is_file(){crate::window::diagnostics::record("search",&format!("native-snapshot-load-failed: {error:#}"),None);}
+                }
             }self.last_save=Instant::now();
         }
         if load_only&&!self.force&&self.volumes.as_ref().is_some_and(|volumes|!volumes.is_empty()){

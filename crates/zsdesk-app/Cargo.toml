@@ -41,7 +41,7 @@ path = "examples/enum_probe.rs"
 required-features = []
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem","Win32_UI_Controls_Dialogs"] }
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",

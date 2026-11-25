@@ -6,7 +6,7 @@ use anyhow::{Result,ensure,bail};
 pub struct Query{expr:Expr,pinyin:bool}
 impl Query{
     pub fn parse(text:&str,pinyin:bool)->Result<Self>{
-        ensure!(text.chars().count()<=512&&!text.contains('\0'),"搜索内容过长或无效");let mut tokens=Vec::new();let mut word=String::new();let mut quote=false;
+        ensure!(text.chars().count()<=super::MAX_EXPRESSION_CHARS&&!text.contains('\0'),"搜索内容过长或无效");let mut tokens=Vec::new();let mut word=String::new();let mut quote=false;
         let flush=|tokens:&mut Vec<Token>,word:&mut String|{if !word.is_empty(){tokens.push(Token::Word(std::mem::take(word)));}};
         for ch in text.chars(){if ch=='"'{quote=!quote;continue;}if quote{word.push(ch);continue;}
             match ch{'<'=>{flush(&mut tokens,&mut word);tokens.push(Token::Open)},'>'=>{flush(&mut tokens,&mut word);tokens.push(Token::Close)},

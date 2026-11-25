@@ -10,11 +10,13 @@ use zsdesk_core::model::explorer::PreviewProviderPreference;
 pub(super) mod selection;
 use selection::{ViewIdentity,ViewSnapshot};
 
+pub(super) const ACTIVATE_ENTRY:u32 = WM_APP + 192;
 pub(super) const TIMER:usize=8;
 const LOAD_TIMEOUT:Duration=Duration::from_secs(30);
 static SERIAL:AtomicU64=AtomicU64::new(1);
+fn normal_text_percent()->u16 { 100 }
 #[derive(Clone,Serialize,Deserialize)]
-struct Request{parent:u32,owner:isize,path:PathBuf,provider:PreviewProviderPreference,dark:bool,hover:bool,generation:u64,close:bool,embedded:Option<[i32;4]>}
+struct Request{#[serde(default="normal_text_percent")] text_percent:u16,parent:u32,owner:isize,path:PathBuf,provider:PreviewProviderPreference,dark:bool,hover:bool,generation:u64,close:bool,embedded:Option<[i32;4]>}
 #[derive(Serialize,Deserialize)]
 struct Status{pid:u32,hwnd:isize,generation:u64,ready:bool,kind:String,notice:String}
 
@@ -39,7 +41,7 @@ pub(super) fn cleanup(workspace:&Path){
                 let id=tail.strip_suffix(".json").or_else(||tail.strip_suffix(".tmp")).unwrap_or(tail);
                 !id.is_empty()&&id.bytes().all(|byte|byte.is_ascii_digit())
             }));
-        if !["request.json","request.tmp","status.json","status.tmp","worker.stderr.log","wps-lifecycle.json","wps-worker.json"].contains(&name.as_ref())
+        if !["request.json","request.tmp","activate.json","activate.tmp","status.json","status.tmp","worker.stderr.log","wps-lifecycle.json","wps-worker.json"].contains(&name.as_ref())
             && !protocol && !(name.starts_with("wps-")&&name.ends_with(".pdf")){continue;}
         if item.path().symlink_metadata().is_ok_and(|metadata|metadata.is_file()&&metadata.file_attributes()&0x400==0){let _=fs::remove_file(item.path());}
     }}
@@ -62,7 +64,7 @@ impl PreviewProcess {
         let workspace=root.join(format!("preview-{}-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
         fs::create_dir(&workspace)?;
-        let request=Request{parent:std::process::id(),owner:owner.0 as isize,path:path.to_path_buf(),provider,dark,hover,generation:1,close:false,embedded};
+        let request=Request{text_percent:100,parent:std::process::id(),owner:owner.0 as isize,path:path.to_path_buf(),provider,dark,hover,generation:1,close:false,embedded};
         // Errors before spawning still own this newly created protocol directory.
         let prepared=(||->Result<_>{
             write_json(&workspace.join("request.json"),&request)?;
@@ -94,6 +96,17 @@ impl PreviewProcess {
     }
     pub(super) fn owns_window(&self,hwnd:HWND)->bool{hwnd==self.hwnd.get()&&!hwnd.0.is_null()||unsafe{IsChild(self.hwnd.get(),hwnd)}.as_bool()}
     pub(super) fn pre_translate(&mut self,_message:&MSG)->bool{false}
+    pub(super) fn activation(&self, slot:&super::Slot, pid:usize, generation:u64)->Option<PathBuf> {
+        if self.request.generation != generation || self.child.borrow().as_ref()?.id() as usize != pid { return None; }
+        let snapshot = ViewSnapshot::capture(slot)?;
+        if self.selection.as_ref() != Some(&snapshot.identity) { return None; }
+        let file = self.workspace.join("activate.json");
+        if fs::metadata(&file).ok()?.len() > 65536 { return None; }
+        let (number,target):(u64,PathBuf) = serde_json::from_slice(&fs::read(file).ok()?).ok()?;
+        let base = &self.request.path;
+        if number != generation || !base.is_absolute() || target.components().any(|c| matches!(c,std::path::Component::ParentDir)) { return None; }
+        (target == *base || target.parent() == Some(base)).then_some(target)
+    }
     fn layout(&mut self,bounds:[i32;4]){
         let hwnd=self.hwnd.get();if hwnd.0.is_null(){return;}
         let mut current=RECT::default();let _=unsafe{GetWindowRect(hwnd,&mut current)};
@@ -101,6 +114,12 @@ impl PreviewProcess {
         if [origin.x,origin.y,current.right-current.left,current.bottom-current.top]!=bounds{
             let _=unsafe{SetWindowPos(hwnd,None,bounds[0],bounds[1],bounds[2],bounds[3],SWP_NOACTIVATE|SWP_NOZORDER|SWP_ASYNCWINDOWPOS)};
         }
+    }
+    pub(super) fn set_text_percent(&mut self,percent:u16)->Result<()>{
+        if self.request.text_percent==percent {return Ok(());}
+        let mut next=self.request.clone();next.text_percent=percent;
+        if self.child.borrow().is_some(){write_json(&self.workspace.join("request.json"),&next)?;}
+        self.request=next;Ok(())
     }
     pub(super) fn set_dark(&mut self,dark:bool)->Result<()>{
         if self.request.dark==dark{return Ok(());}
@@ -203,6 +222,7 @@ fn run_worker(path:&Path)->Result<()>{
     let owner=HWND(request.owner as*mut _);
     let bounds=request.embedded.map(|r|RECT{left:r[0],top:r[1],right:r[0]+r[2],bottom:r[1]+r[3]});
     let mut preview=super::quick_preview::QuickPreview::create_worker(owner,request.provider,request.dark,request.hover,bounds)?;
+    preview.set_text_percent(request.text_percent);
     let status_path=path.with_file_name("status.json");
     let load=|preview:&mut super::quick_preview::QuickPreview,request:&Request|->Result<()>{
         let hwnd=preview.window();
@@ -231,12 +251,19 @@ fn run_worker(path:&Path)->Result<()>{
             if !owner_alive(&request){break;}
             if let Ok(next)=read_request(path){
                 if next.parent!=request.parent||next.owner!=request.owner||next.close{break;}
+                if next.text_percent!=request.text_percent {preview.set_text_percent(next.text_percent);request.text_percent=next.text_percent;}
                 if next.dark!=request.dark{preview.set_dark(next.dark);request.dark=next.dark;}
                 if next.generation!=request.generation{request=next;load(&mut preview,&request)?;}
             }
             continue;
         }
         if !preview.pre_translate(&message){unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
+        if let Some(target) = preview.take_activation() {
+            if request.embedded.is_some() && owner_alive(&request) {
+                write_json(&path.with_file_name("activate.json"), &(request.generation,target))?;
+                let _ = unsafe { PostMessageW(Some(owner), ACTIVATE_ENTRY, WPARAM(std::process::id() as usize), LPARAM(request.generation as isize)) };
+            }
+        }
     }
     preview.close();Ok(())
 }
@@ -298,7 +325,7 @@ mod lifecycle_tests {
         fs::create_dir_all(&root)?;
         let workspace=root.join(format!("preview-exit-test-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)));
         fs::create_dir(&workspace)?;
-        let request=Request{parent:std::process::id(),owner:0,path:root.join("selected-document.txt"),
+        let request=Request{text_percent:100,parent:std::process::id(),owner:0,path:root.join("selected-document.txt"),
             provider:PreviewProviderPreference::System,dark:false,hover:false,generation:1,close:false,
             embedded:embedded.then_some([0,0,200,200])};
         write_json(&workspace.join("request.json"),&request)?;

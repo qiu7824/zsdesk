@@ -44,12 +44,6 @@ fn dropdown_items(bookmarks:&[Bookmark],root:Option<u64>)->Vec<MenuItemSpec>{
 impl WindowState {
     pub(super) fn renamed_bookmark_index(&self)->Option<usize>{self.rename_id.and_then(|id|self.session.bookmarks.iter().position(|b|b.id==id))}
     pub(super) fn bookmark_index(&self,slot:usize)->Option<usize>{self.bookmark_order.get(slot).copied()}
-    pub(super) fn bookmark_label(&self,index:usize)->String{
-        let item=&self.session.bookmarks[index];
-        if self.session.ui.bookmark_display!=BookmarkDisplay::Expanded{return item.display_name.clone();}
-        let depth=self.session.bookmark_depth(index);
-        format!("{}{}{}","› ".repeat(depth.min(4)),if item.is_folder{if item.collapsed{"▸ "}else{"▾ "}}else{""},item.display_name)
-    }
     fn row_of_bookmarks(&self)->LayoutRect{
         if self.layout.bookmarks_row.is_empty(){self.layout.nav_row}else{self.layout.bookmarks_row}
     }
@@ -211,7 +205,7 @@ impl WindowState {
         if self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{unsafe{self.bookmark_dropdown(None,self.layout.bookmark_overflow);}return;}
         let hidden = self.layout.bookmarks.len();
         let mut items: Vec<MenuItemSpec> = self.bookmark_order.iter().copied().skip(hidden)
-            .map(|i| submenu(&self.bookmark_label(i).replace('&',"&&"),vec![
+            .map(|i| submenu(&self.session.bookmarks[i].display_name.replace('&',"&&"),vec![
                 entry(zsdesk_core::i18n::text("打开 / 展开"),&format!("bm-{i}"),true,false),entry(zsdesk_core::i18n::text("管理收藏"),&format!("edit-{i}"),true,false)])).collect();
         items.push(entry(zsdesk_core::i18n::text("收藏当前文件夹\tCtrl+D"), "add", true, false));
         items.push(entry(zsdesk_core::i18n::text("新建分类目录"),"new-folder",true,false));
@@ -258,7 +252,7 @@ impl WindowState {
         // Borderless EDIT inside the rounded text box painted by the chrome.
         let line = self.edit_line_height();
         let pad = self.s(8);
-        let width=if self.layout.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))};
+        let width = if self.layout.bookmarks_vertical { rect.width } else { rect.width.max(self.s(140)) };
         let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, (width - pad * 2).max(1), line);
         unsafe {
             move_control(self.rename_hwnd, r);

@@ -12,7 +12,8 @@ pub(super) fn same_location(left:&ShellLocation,right:&ShellLocation)->bool {
     match (left,right) {
         (ShellLocation::Path(left),ShellLocation::Path(right))=>crate::explorer_forwarder::same_path(left,right),
         (ShellLocation::Shell{parsing_name:left,pidl:left_id,..},ShellLocation::Shell{parsing_name:right,pidl:right_id,..})=>{
-            if !left.trim().is_empty()&&!right.trim().is_empty(){left==right}
+            if zsdesk_windows::shell::is_recycle_bin_name(left) && zsdesk_windows::shell::is_recycle_bin_name(right){true}
+            else if !left.trim().is_empty()&&!right.trim().is_empty(){left==right}
             else{left_id.as_deref().zip(right_id.as_deref()).is_some_and(|(left,right)|
                 zsdesk_windows::shell::pidl::valid(left)&&zsdesk_windows::shell::pidl::valid(right)&&left==right)}
         },
@@ -77,17 +78,34 @@ impl WindowState {
             // Switching focus between two visible panes is not navigation.
             // Preserve the registration identity across a multi-item callback.
             if !self.shell_entries().iter().any(|entry|request.matches(entry)){continue;}
+            self.deferred_selection = None;
             let Some(browser)=&self.browser else{continue;};
             let Ok(view)=(unsafe{browser.current_view()})else{continue;};
             if request.child_pidl.as_deref().is_some_and(|bytes|!valid_relative_pidl(bytes)){continue;}
             crate::instance::request_activation(self.hwnd);
             unsafe{browser.focus();}
-            let pidl=request.child_pidl.as_ref().map_or(std::ptr::null(),|bytes|bytes.as_ptr().cast());
+            let pidl:*const windows::Win32::UI::Shell::Common::ITEMIDLIST=request.child_pidl.as_ref().map_or(std::ptr::null(),|bytes|bytes.as_ptr().cast());
+            // A file reveal can arrive before the view has finished populating its rows.
+            // For a replacement selection reuse the same bounded confirmation as --select.
+            let name = if request.flags & 5 == 5 && !pidl.is_null() {
+                use windows::{core::Interface,Win32::UI::Shell::{IFolderView2,IShellFolder,IShellItem,SHCreateItemWithParent,SIGDN_FILESYSPATH}};
+                (|| {
+                    let parent:IShellFolder = unsafe { view.cast::<IFolderView2>().ok()?.GetFolder() }.ok()?;
+                    let item:IShellItem = unsafe { SHCreateItemWithParent(None,&parent,pidl) }.ok()?;
+                    let raw=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)}.ok()?;
+                    let path=unsafe{raw.to_string()}.ok().map(PathBuf::from);
+                    unsafe{windows::Win32::System::Com::CoTaskMemFree(Some(raw.0.cast()))};
+                    let path=path?;
+                    let folder=request.location.as_path()?;
+                    crate::explorer_forwarder::same_path(path.parent()?,folder).then(||path.file_name().map(|n|n.to_owned())).flatten()
+                })()
+            } else {None};
             // Keep the Shell's per-item selection semantics. In particular,
             // only its first callback may ask to deselect previous items.
             if let Err(error)=unsafe{view.SelectItem(pidl,request.flags&(1|4|8|16))}{
                 diagnostics::record("shell-registration","selection-failed",Some(error.code().0));
             }
+            if let Some(name)=name { self.defer_selection(vec![name],false); }
         }
     }
 }

@@ -550,6 +550,12 @@ fn prepare(
     }
     Ok((ready, mapped))
 }
+#[cfg(test)]
+pub(super) fn hold_snapshot(path:&Path,options:&SearchOptions)->Result<impl Drop> {
+    let (_,mapping)=prepare(path,options,&||false)?;
+    Ok(mapping)
+}
+
 pub(super) fn prime(path: &Path, options: &SearchOptions, cancel: &impl Fn() -> bool) {
     // Speculative preparation only. Actual queries verify the opened file's digest.
     let bits = snapshot::Policy {

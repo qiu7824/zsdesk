@@ -77,6 +77,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
         match action{
             Some("stop")=>{let _=unsafe{DestroyWindow(hwnd)};},
             Some("reload")=>{
+                crate::utility_panel::refresh_search_colors();
                 let result=configure(hwnd,unsafe{&mut*pointer});
                 match result{Ok(persistent)=>{
                     unsafe{&mut*pointer}.persistent=persistent;

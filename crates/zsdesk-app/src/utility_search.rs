@@ -11,18 +11,11 @@ use zsui::{Color, ColorRole, Dpi, HorizontalAlign, NativeDrawCommand, NativeDraw
     NativeDrawPlan, NativeDrawTextCommand, Rect, SemanticTextStyle, TextRole, WindowsGdiDrawSink,
     WindowsGdiPalette, ZsPlatformStyle};
 pub(super) const FIRST_FILTER: i32 = 30;
-pub(super) const FILTERS: [(&str, &str); 5] = [
-    ("全部", ""),
-    ("文件", "file:"),
-    ("文件夹", "folder:"),
-    (
-        "文档",
-        "ext:pdf;doc;docx;xls;xlsx;ppt;pptx;txt;md;rtf;odt;wps;et;dps",
-    ),
-    (
-        "图片",
-        "ext:jpg;jpeg;png;webp;gif;bmp;tif;tiff;heic;avif;svg",
-    ),
+use crate::fast_search::file_types;
+pub(super) const FILTERS: [(&str, &str); 8] = [
+    ("全部", ""), ("文件", "file:"), ("文件夹", "folder:"),
+    ("文档", file_types::DOCUMENTS), ("图片", file_types::IMAGES),
+    ("视频", file_types::VIDEOS), ("音频", file_types::AUDIO), ("其他", file_types::OTHER),
 ];
 pub(super) const WIDTH_CHANGED: u32 = WM_APP + 109;
 pub(super) const COPY_PATH: u32 = WM_APP + 110;
@@ -55,7 +48,7 @@ pub(super) struct SearchView {
     pub buttons:Rc<search_buttons::Buttons>,
     pub table:Rc<result_table::Table>,
     pub staged:Option<(Vec<PathBuf>,std::time::Instant)>,
-    widths: [Option<i32>; 4],
+    widths: [Option<i32>; 5],
     icons: HashMap<(bool, OsString), i32>,
     pub last_query: String,
 }
@@ -69,16 +62,16 @@ impl SearchView {
             .ok()
             .filter(|m| m.len() < 2048)
             .and_then(|_| std::fs::read(file).ok())
-            .and_then(|b| serde_json::from_slice::<[Option<i32>; 4]>(&b).ok())
-            .unwrap_or_default()
-            .map(|w| w.filter(|v| (32..=4096).contains(v)));
+            .and_then(|b| serde_json::from_slice::<Vec<Option<i32>>>(&b).ok())
+            .unwrap_or_default();
+        let widths = std::array::from_fn(|i| widths.get(i).copied().flatten().filter(|v| (32..=4096).contains(v)));
         Self {
             widths,
             ..Default::default()
         }
     }
     pub(super) fn reset_widths(&mut self, profile: &Path) -> Result<()> {
-        self.widths = [None; 4];
+        self.widths = [None; 5];
         self.save(profile)
     }
     fn save(&self, profile: &Path) -> Result<()> {
@@ -103,7 +96,7 @@ impl SearchView {
         }
         Ok(())
     }
-    fn measured_widths(&self, available: i32, dpi: u32) -> [i32; 4] {
+    fn measured_widths(&self, available: i32, dpi: u32) -> [i32; 5] {
         let px = |dip: i32| (i64::from(dip) * i64::from(dpi) / 96) as i32;
         let mut widths = self.widths.map(|v| v.map(px).unwrap_or(0));
         if self.widths[2].is_none() {
@@ -112,7 +105,8 @@ impl SearchView {
         if self.widths[3].is_none() {
             widths[3] = px(154);
         }
-        let flexible = (available - widths[2] - widths[3]).max(0);
+        if self.widths[4].is_none() { widths[4] = px(154); }
+        let flexible = (available - widths[2] - widths[3] - widths[4]).max(0);
         match (self.widths[0], self.widths[1]) {
             (None, None) => {
                 widths[0] = (flexible * 40 / 100).max(px(110));
@@ -236,7 +230,7 @@ impl Panel {
         let input = self.input_plan(width).text_bounds;
         move_to(self.edit, input.x, input.y + (input.height - s(26)) / 2, input.width, s(26));
         let mut left = s(16);
-        for (i, w) in [60, 60, 75, 60, 60].into_iter().enumerate() {
+        for (i, w) in [60, 60, 75, 60, 60, 60, 60, 60].into_iter().enumerate() {
             move_to(child(FIRST_FILTER + i as i32), left, s(65), s(w), s(29));
             left += s(w + 5);
         }
@@ -340,12 +334,19 @@ mod tests {
         }
     }
     #[test]
+    fn other_filter_keeps_unclassified_and_extensionless_files() {
+        let q = crate::fast_search::query::Query::parse(&filtered_query("", 7), false).unwrap();
+        for (name, dir, expected) in [("part.dwg",false,true),("readme",false,true),("record.mp3",false,false),("folder",true,false)] {
+            assert_eq!(q.matches(name,dir,name), expected);
+        }
+    }
+    #[test]
     fn resized_columns_keep_manual_width_and_scale_across_monitors() {
         let view = SearchView {
-            widths: [Some(215), None, None, None],
+            widths: [Some(215), None, None, None, None],
             ..Default::default()
         };
-        assert_eq!(view.measured_widths(1000, 96), [215, 543, 88, 154]);
+        assert_eq!(view.measured_widths(1000, 96), [215, 389, 88, 154, 154]);
         assert_eq!(view.measured_widths(750, 96)[0], 215);
         assert_eq!(view.measured_widths(1500, 144)[0], 322);
     }

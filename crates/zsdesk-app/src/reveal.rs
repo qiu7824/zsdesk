@@ -2,6 +2,7 @@
 use std::{ffi::OsString,path::PathBuf};
 pub const COPYDATA_TAG:usize=0x3152464e;
 pub const VERIFY_TAG:usize=0x3252464e;
+pub const VERIFY_RECYCLE_BIN:usize=0x3452464e;
 pub const VERIFY_THIS_PC:usize=0x3352464e;
 pub fn encode(folder:&std::path::Path,items:&[PathBuf])->Option<Vec<u8>>{
     use std::os::windows::ffi::OsStrExt;
@@ -22,13 +23,14 @@ pub fn decode(bytes:&[u8])->Option<(PathBuf,Vec<OsString>)>{
     let mut offset=0;
     let mut next=||{
         let end=units[offset..].iter().position(|u|*u==0)?+offset;
-        let value=String::from_utf16(&units[offset..end]).ok()?;offset=end+1;
+        use std::os::windows::ffi::OsStringExt;
+        let value=OsString::from_wide(&units[offset..end]);offset=end+1;
         let path=PathBuf::from(value);path.is_absolute().then_some(path)
     };
     let folder=next()?;let mut names=Vec::with_capacity(count);
     for _ in 0..count{
         let item=next()?;
-        if !item.parent()?.to_string_lossy().trim_end_matches(['\\','/']).eq_ignore_ascii_case(folder.to_string_lossy().trim_end_matches(['\\','/'])){return None;}
+        if !crate::explorer_forwarder::same_path(item.parent()?, &folder){return None;}
         names.push(item.file_name()?.to_owned());
     }
     if offset!=units.len(){return None;}

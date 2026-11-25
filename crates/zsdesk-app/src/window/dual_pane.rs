@@ -22,7 +22,7 @@ pub(super) struct InactivePane {
     search_scope: Option<ShellLocation>,
     search_result: Option<ShellLocation>,
     browser_role: BrowserRole,
-    native_theme_dark:Option<bool>,
+    pub(super) native_theme_dark:Option<bool>,
     fast_search: Option<crate::fast_search::FastSearch>,
     fast_generation: u64,
     fast_submitted: Option<integrated_search::SubmittedSearch>,
@@ -122,6 +122,7 @@ impl WindowState {
             if cfg!(test) { ExplorerBrowserHost::create_transient_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
             else { ExplorerBrowserHost::create_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
         }?;
+        browser.use_list_renderer(self.session.ui.interface_text_percent != 100);
         if !cfg!(test) { browser.set_view_state_name(&view_memory::property_bag_name(&self.config_path))?; }
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
         if let Some(picker)=&self.picker{browser.set_picker(picker.pattern(),picker.options.multiple,picker.options.kind.folders());}

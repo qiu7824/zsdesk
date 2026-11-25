@@ -64,9 +64,14 @@ fn request(url:&str,post:bool,limit:u64,mut write:impl FnMut(&[u8])->Result<()>)
 }
 fn metadata(url:&str,post:bool)->Result<Vec<u8>>{let mut data=Vec::new();request(url,post,1024*1024,|part|{data.extend_from_slice(part);Ok(())})?;Ok(data)}
 fn bytes(url:&str)->Result<Vec<u8>>{metadata(url,false)}
+fn compact_install()->bool{
+    let Some(registered)=zsdesk_windows::integration::compact_install_directory() else{return false;};
+    std::env::current_exe().ok().is_some_and(|exe|exe.parent().is_some_and(|dir|
+        crate::explorer_forwarder::same_path(dir,&registered)))
+}
 fn package_name(tag:&str,edition:&str,portable:bool)->Result<String>{
     ensure!(matches!(edition,"standard"|"network"|"desktop"|"full"|"themed"|"desktop-box"), "{}", zsdesk_core::tr_format!("未知的程序版本类型"));
-    let suffix=if portable{".zip"}else{"-setup.exe"};
+    let suffix=if portable{".zip"}else if edition=="full" && compact_install(){"-offline-setup.exe"}else{"-setup.exe"};
     Ok(format!("ZSDesk-{}-{edition}-x64{suffix}",tag.trim_start_matches('v')))
 }
 fn current_status(remote:[u64;3],current:[u64;3],tag:&str)->Option<Outcome>{
@@ -114,7 +119,7 @@ fn portable()->bool{
     let Ok(exe)=std::env::current_exe() else{return false};
     let Some(dir)=exe.parent() else{return false};
     if dir.join("portable.flag").is_file(){return true;}
-    if !dir.join("manifest.json").is_file(){return false;}
+    if compact_install() || !dir.join("manifest.json").is_file(){return false;}
     // ZIP distributions have no Inno uninstall record. Their profile may still use AppData.
     let Ok(entries)=fs::read_dir(dir) else{return false};
     !entries.filter_map(Result::ok).any(|entry|{

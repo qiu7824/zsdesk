@@ -15,7 +15,7 @@ fn leaves_results(role:BrowserRole,pending_search:bool,target:&ShellLocation)->b
 
 impl WindowState {
     pub(super) fn navigation_tree_options(&self)->zsdesk_windows::shell::NamespaceTreeOptions {
-        zsdesk_windows::shell::NamespaceTreeOptions{show_recycle_bin:self.session.ui.navigation_show_recycle_bin,
+        zsdesk_windows::shell::NamespaceTreeOptions{show_libraries:self.session.ui.navigation_show_libraries,show_recycle_bin:self.session.ui.navigation_show_recycle_bin,
             show_network:self.session.ui.navigation_show_network,expand_this_pc:self.session.ui.navigation_expand_this_pc}
     }
     pub(super) fn rebuild_navigation_tree(&mut self) {
@@ -80,6 +80,7 @@ impl WindowState {
         if global && self.browser_role==BrowserRole::Ordinary{
             if let Err(error)=self.reset_browser_host(){self.show_message(zsdesk_core::tr_format!("无法创建搜索结果视图：{error}", error=error));unsafe{self.navigation_failed();}return;}
         }
+        if let Some(browser) = &self.browser { browser.use_list_renderer(global || self.session.ui.interface_text_percent != 100); }
         self.browser_role=if global{BrowserRole::Results}else{BrowserRole::Ordinary};
         let result=self.browser.as_ref().map(|b|unsafe {b.navigate(&target)});
         if !matches!(result,Some(Ok(()))) {unsafe {self.navigation_failed();}return;}
@@ -188,7 +189,7 @@ impl WindowState {
             }}
             self.theme_children();
             self.refresh_status();
-            if completed_request{if let ShellLocation::Search{query,..}=&current{self.start_fast_search(query);}}
+            if completed_request{if let ShellLocation::Search{query,..}=&current{self.start_fast_search(query);super::context_menu::schedule_prewarm(self.hwnd);}}
             self.relayout();self.position_children();
         }
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}

@@ -8,6 +8,10 @@ use windows::{Win32::{Foundation::RECT,System::Com::{CoCreateInstance,CLSCTX_INP
     SHCreateItemFromIDList,SHCreateItemWithParent,SIGDN_DESKTOPABSOLUTEPARSING,SVGIO_ALLVIEW,
     SVSI_SELECT,SVSI_DESELECTOTHERS,SVSI_NOTAKEFOCUS,SVSI_FOCUSED,SVSI_SELECTIONMARK,ILGetSize,Common::ITEMIDLIST}}};
 
+// These non-visible Shell views provide selection and command services. Give
+// them a nonempty viewport without laying out a full explorer-sized page.
+const MENU_VIEWPORT:RECT=RECT{left:0,top:0,right:96,bottom:64};
+
 fn view_matches(view:&IShellView,item:&IShellItem)->bool{
     let Ok(view)=view.cast::<IFolderView2>()else{return false;};
     if let Ok(current)=unsafe{view.GetFolder::<IShellItem>()}{
@@ -46,12 +50,12 @@ impl BackgroundView {
                 REUSED.with(|reused|reused.set(true));return Ok(host);
             }
         }
-        let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),w!(""),WS_POPUP,0,0,640,480,None,None,None,None)}?;
+        let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),w!(""),WS_POPUP,0,0,MENU_VIEWPORT.right,MENU_VIEWPORT.bottom,None,None,None,None)}?;
         let result=(||->Result<(IExplorerBrowser,IShellView)>{
             let browser:IExplorerBrowser=unsafe{CoCreateInstance(&ExplorerBrowser,None,CLSCTX_INPROC_SERVER)}?;
             let result=(||->Result<IShellView>{
                 unsafe{browser.SetOptions(EBO_NOBORDER|EBO_NOPERSISTVIEWSTATE)?;
-                    browser.Initialize(window,&RECT{left:0,top:0,right:640,bottom:480},None)?;browser.BrowseToObject(item,0)?;}
+                    browser.Initialize(window,&MENU_VIEWPORT,None)?;browser.BrowseToObject(item,0)?;}
                 let deadline=Instant::now()+Duration::from_secs(5);
                 loop {
                     // IExplorerBrowser may expose its initial view before the
@@ -263,13 +267,13 @@ impl SelectionSet{
 }
 
 fn make_selection_host(namespace:&SelectionNamespace,request:&Request,events:&EventSet,deadline:Instant)->Result<Rc<BackgroundView>>{
-    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),w!(""),WS_POPUP,0,0,640,480,None,None,None,None)}?;
+    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),w!(""),WS_POPUP,0,0,MENU_VIEWPORT.right,MENU_VIEWPORT.bottom,None,None,None,None)}?;
     let result=(||->Result<(IExplorerBrowser,IShellView)>{
         let browser:IExplorerBrowser=unsafe{CoCreateInstance(&ExplorerBrowser,None,CLSCTX_INPROC_SERVER)}?;
         let result=(||->Result<IShellView>{
             let mut options=EBO_NOBORDER|EBO_NOPERSISTVIEWSTATE;
             if matches!(namespace,SelectionNamespace::Results){options|=EBO_NAVIGATEONCE;}
-            unsafe{browser.SetOptions(options)?;browser.Initialize(window,&RECT{left:0,top:0,right:640,bottom:480},None)?;}
+            unsafe{browser.SetOptions(options)?;browser.Initialize(window,&MENU_VIEWPORT,None)?;}
             match namespace{
                 SelectionNamespace::Folder(item)=>unsafe{browser.BrowseToObject(item,0)}?,
                 SelectionNamespace::Results=>unsafe{browser.FillFromObject(None::<&IUnknown>,EBF_NODROPTARGET)}?,

@@ -21,20 +21,20 @@ pub(super) fn prewarm_active_view(owner:HWND){
         ACTIVE.with(|active|active.borrow().contains_key(&(owner.0 as isize))){return;}
     let slot=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)} as *const Slot;
     if slot.is_null(){return;}
-    let (window,identity,folder,options)={
+    let (window,identity,folder,results,options)={
         let Ok(state)=unsafe{&*slot}.try_borrow()else{return;};
         let Some(state)=state.as_ref()else{return;};
         if state.destroyed || state.pending.is_some() || state.picker.is_some(){return;}
-        let folder=match state.current_location(){ShellLocation::Path(path)=>Some(path.clone()),ShellLocation::ThisPc=>None,_=>return};
+        let folder=match state.current_location(){ShellLocation::Path(path)=>Some(path.clone()),ShellLocation::ThisPc | ShellLocation::Search{..}=>None,_=>return};
         let Some(identity)=state.identity_for_source(state.browser_source)else{return;};
         let prefs=crate::context_preferences::current(&state.config_path).unwrap_or_else(||state.session.ui.context_menu.clone());
-        (state.view_hwnd,identity,folder,crate::context_preferences::native(&prefs))
+        (state.view_hwnd,identity,folder,matches!(state.current_location(), ShellLocation::Search{..}),crate::context_preferences::native(&prefs))
     };
     if options.quick_first{return;}
     let Ok(view)=menu::attached_menu_view(window)else{return;};
     let Ok(parent)=background_pidl(&view)else{return;};
     if !live_source(owner,window,identity){return;}
-    let context=crate::context_menu_process::MenuViewContext{folder:Some(parent.clone()),..Default::default()};
+    let context=crate::context_menu_process::MenuViewContext{folder:Some(parent.clone()),results,..Default::default()};
     crate::context_menu_process::prewarm::start(owner,parent,folder,true,options,Some(context));
 }
 pub(super) type SourcePreferences=(bool,menu::ContextMenuOptions);
@@ -190,7 +190,7 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
         (Some(saved),items)
     }else{(None,snapshot(view)?)};
 
-    let source_folder=background_pidl(view)?;
+    let source_folder=match &visual {Some(saved)=>saved.folder.clone(),None=>background_pidl(view)?};
     let background=pidls.is_empty().then(||source_folder.clone());
     let repeated=if !new&&!catalog&&!keyboard{
         ACTIVE.with(|active|{

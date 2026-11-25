@@ -165,7 +165,7 @@ impl WindowState{
     }
     pub(super) fn rebuild_search_index(&mut self){
         self.sync_search_preferences();
-        if !self.session.ui.search_backend.is_builtin(){self.launch_search_settings(false);return;}
+        if !self.session.ui.search_backend.is_builtin(){self.launch_search_settings();return;}
         let query=match self.current_location(){ShellLocation::Search{query,..}=>Some(query.clone()),_=>None};
         self.cancel_all_search_backends();
         match crate::fast_search::FastSearch::for_profile(&self.config_path,self.hwnd,WM_FAST_SEARCH,crate::fast_search::SearchOptions::from_ui(&self.session.ui)){

@@ -4,7 +4,7 @@ use std::{ffi::OsString,time::{Duration,Instant}};
 
 pub(super) const TIMER:usize=26;
 pub(super) struct Pending {
-    tab:u64,location:ShellLocation,names:Vec<OsString>,rename:bool,rename_requested:Option<Instant>,deadline:Instant,cursor:usize,input:Option<global_search::InputWatch>,
+    tab:u64,location:ShellLocation,names:Vec<OsString>,rename:bool,rename_requested:Option<Instant>,deadline:Instant,confirm_after:Option<Instant>,cursor:usize,input:Option<global_search::InputWatch>,
 }
 impl WindowState {
     pub(super) fn defer_selection(&mut self,names:Vec<OsString>,rename:bool){
@@ -12,7 +12,7 @@ impl WindowState {
         if self.rename_follow.take().is_some() { let _ = unsafe { KillTimer(Some(self.hwnd), super::rename_follow::TIMER) }; }
         let duration=Duration::from_secs(8)+Duration::from_millis((names.len().min(10_000).div_ceil(32)as u64)*50);
         self.deferred_selection=Some(Pending{tab:self.session.active_tab().id,location:self.current_location().clone(),
-            names,rename,rename_requested:None,deadline:Instant::now()+duration,cursor:0,input:global_search::InputWatch::new()});
+            names,rename,rename_requested:None,deadline:Instant::now()+duration,confirm_after:None,cursor:0,input:global_search::InputWatch::new()});
         unsafe{SetTimer(Some(self.hwnd),TIMER,50,None);}
     }
     pub(super) fn select_created_folder(&mut self,path:PathBuf){
@@ -47,6 +47,13 @@ impl WindowState {
                 self.deferred_selection=Some(request);return;
             }
         }
+        if let Some(at) = request.confirm_after {
+            if Instant::now() < at { self.deferred_selection=Some(request); return; }
+            let selected = self.browser.as_ref().map(|b| b.selection_paths_limit(2)).unwrap_or_default();
+            if self.current_location().as_path().is_some_and(|folder| selected.len()==1 &&
+                crate::explorer_forwarder::same_path(&folder.join(&request.names[0]),std::path::Path::new(&selected[0]))) { return; }
+            request.confirm_after=None;
+        }
         let end=(request.cursor+32).min(request.names.len());
         let result=self.browser.as_ref().map(|browser|{
             if request.rename&&!self.background_pane{browser.rename_child(&request.names[0])}
@@ -60,7 +67,12 @@ impl WindowState {
                 // Without an input observer, repeating an acknowledged rename
                 // could reopen an editor the user just dismissed.
                 if request.input.is_none(){return;}
-            }else{if end==request.names.len(){return;}request.cursor=end;}
+            } else if request.names.len()==1 && request.input.is_some() {
+                // DefView may accept SelectItem before its initial enumeration resets focus.
+                request.confirm_after=Some(Instant::now()+Duration::from_millis(350));
+            } else {
+                if end==request.names.len(){return;}request.cursor=end;
+            }
         }
         if Instant::now()<request.deadline{self.deferred_selection=Some(request);}
         else{diagnostics::record("selection","item-not-materialized",None);}

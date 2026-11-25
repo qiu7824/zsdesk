@@ -96,6 +96,7 @@ fn create_runner(output: &Path, folder: &Path) -> Result<OwnedRunner> {
         dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES }) }.ok()?;
     let mut session = storage::default_session();
     session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;
+    session.ui.everything_executable=std::env::var_os("ZSDESK_EVERYTHING_TEST_EXE").map(PathBuf::from);
     session.tabs = vec![ExplorerTab::new(1, ShellLocation::Path(folder.to_owned()))];
     session.active_tab = 0;
     session.next_id = 2;
@@ -318,6 +319,8 @@ fn native_search_result_materialization_timing()->Result<()>{
 #[ignore = "Requires isolated fixture-only Everything, ZSDESK_EVERYTHING_TEST_PATH/QUERY and ZSDESK_NATIVE_TEST_OUTPUT"]
 fn native_everything_main_window_search_controls_and_results() -> Result<()> {
     ensure!(std::env::var("ZSDESK_EVERYTHING_INSTANCE").is_ok_and(|instance| instance == "ZSDeskAcceptance"), "isolated fixture Everything instance required");
+    let selected=PathBuf::from(std::env::var_os("ZSDESK_EVERYTHING_TEST_EXE").context("fixture Everything executable required")?);
+    ensure!(crate::fast_search::everything::available(Some(&selected)),"invalid fixture Everything executable");
     let fixture = PathBuf::from(std::env::var_os("ZSDESK_EVERYTHING_TEST_PATH").context("fixture path required")?);
     let query = std::env::var("ZSDESK_EVERYTHING_TEST_QUERY").context("fixture query required")?;
     let output = PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("isolated output required")?).join("everything-window");

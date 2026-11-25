@@ -27,9 +27,10 @@ pub const FOLDER_DDE_COMMAND:&str=r#"[Open("%V")]"#;
 /// Classes receiving the "使用 ZSDesk 打开" verb.
 const THIS_PC_CLASS:&str=r"CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 const THIS_PC_ROOT:&str=r"Software\Classes\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
-const VERB_CLASSES: [&str; 4] = ["Directory", "Drive", r"Directory\Background",THIS_PC_CLASS];
+const RECYCLE_CLASS:&str=r"CLSID\{645FF040-5081-101B-9F08-00AA002F954E}";
+const VERB_CLASSES: [&str; 5] = ["Directory", "Drive", r"Directory\Background",THIS_PC_CLASS,RECYCLE_CLASS];
 /// Classes whose default verb becomes ZSDesk in default mode.
-const DEFAULT_CLASSES: [&str; 3] = ["Directory", "Drive",THIS_PC_CLASS];
+const DEFAULT_CLASSES: [&str; 4] = ["Directory", "Drive",THIS_PC_CLASS,RECYCLE_CLASS];
 const WIN_E_ROOT: &str = r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
 const WIN_E_COMMAND: &str = r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command";
 const BUILTIN_CLASSES:[&str;2]=["Directory","Drive"];
@@ -285,15 +286,18 @@ fn plan(level: Integration, exe: &Path) -> (Vec<(String, Option<&'static str>, S
     let mut values = Vec::new();
     let mut verb_keys = Vec::new();
     if level == Integration::Off { return (values, verb_keys); }
-    verb_keys.extend([THIS_PC_ROOT.to_string(),format!(r"{THIS_PC_ROOT}\shell")]);
+    for class in [THIS_PC_CLASS, RECYCLE_CLASS] {
+        let root = format!(r"{CLASSES}\{class}");
+        verb_keys.extend([root.clone(), format!(r"{root}\shell")]);
+    }
     for class in VERB_CLASSES {
         let verb = format!(r"{CLASSES}\{class}\shell\{VERB}");
         values.push((verb.clone(), None, "使用 ZSDesk 打开".to_string()));
         values.push((verb.clone(), Some("Icon"), format!("\"{exe}\",0")));
-        values.push((format!(r"{verb}\command"), None, if class==THIS_PC_CLASS{format!("\"{exe}\" --this-pc")}else{format!("\"{exe}\" --shell-open \"%V\"" )}));
+        values.push((format!(r"{verb}\command"), None, if class==THIS_PC_CLASS{format!("\"{exe}\" --this-pc")}else if class==RECYCLE_CLASS{format!("\"{exe}\" shell:RecycleBinFolder")}else{format!("\"{exe}\" --shell-open \"%V\"" )}));
         values.push((format!(r"{verb}\command"),Some("DelegateExecute"),String::new()));
         verb_keys.push(verb.clone());verb_keys.push(format!(r"{verb}\command"));
-        if level==Integration::Default&&class!=THIS_PC_CLASS{
+        if level==Integration::Default&&!matches!(class, THIS_PC_CLASS | RECYCLE_CLASS){
             for (key,value) in dde_values(&verb){values.push((key.clone(),None,value.into()));verb_keys.push(key);}
         }
     }
@@ -406,6 +410,11 @@ pub fn current() -> Integration {
     if default.as_deref() == Some(VERB) { return Integration::Default; }
     if key_exists(&format!(r"{CLASSES}\Directory\shell\{VERB}\command")) { return Integration::ContextMenu; }
     Integration::Off
+}
+
+/// Per-user install root registered by the compact full-edition MSI.
+pub fn compact_install_directory()->Option<std::path::PathBuf>{
+    read_string(r"Software\ZSDesk\Installer\Full",Some("Path")).map(std::path::PathBuf::from)
 }
 
 /// Executable referenced by the registered verb, if any (health check after moves/updates).
@@ -631,6 +640,10 @@ mod tests {
         }}
         let desired=planned_values(Integration::Default,Path::new("z.exe"));
         assert_eq!(desired.iter().filter(|value|builtin_key(&value.key)&&value.kind.is_none()).count(),BUILTIN_CLASSES.len()*BUILTIN_VERBS.len()*VERB_OVERRIDES.len());
+        let bin=format!(r"{CLASSES}\{RECYCLE_CLASS}\shell");
+        assert!(values.iter().any(|(key,name,value)|key==&bin && name.is_none() && value==VERB));
+        assert!(values.iter().any(|(key,name,value)|key==&format!(r"{bin}\{VERB}\command") && name.is_none() && value.ends_with(" shell:RecycleBinFolder")));
+        assert!(!values.iter().any(|(key,_,_)| key.starts_with(&bin) && key.ends_with("ddeexec")));
         assert!(values.iter().any(|(key,name,value)|key==&format!(r"{THIS_PC_ROOT}\shell")&&name.is_none()&&value==VERB));
         assert!(values.iter().any(|(key,name,value)|key==&format!(r"{THIS_PC_ROOT}\shell\{VERB}\command")&&name.is_none()&&value==r#""C:\Apps\ZSDesk.exe" --this-pc"#));
         assert!(values.iter().any(|(key,name,value)|key==WIN_E_COMMAND && name.is_none() && value==r#""C:\Apps\ZSDesk.exe" --win-e"#));

@@ -193,7 +193,7 @@ fn opening_search_only_warms_existing_rows_and_historical_skips_stay_in_diagnost
 
 #[test]fn builtin_preference_blocks_everything_entry_points()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;let profile=fixture.root.join("explorer-session.json");let session=crate::storage::default_session();crate::storage::save(&profile,&session)?;
-    assert!(require_everything(&profile).is_err());assert!(everything::open_settings(&profile).is_err());assert!(everything::enable_service(&profile).is_err());
+    assert!(require_everything(&profile).is_err());assert!(everything::open_settings(&profile).is_err());
     assert!(everything::query_folder_sizes(&profile,&[],1,||false).is_err());assert!(everything::query_page(&profile,&everything::QueryOptions::default(),1,||false).is_err());
     assert!(!fixture.index.exists());Ok(())
 }
@@ -322,7 +322,7 @@ fn native_backend_choice_does_not_cross_start()->Result<()>{
             ensure!(Instant::now()<deadline,"backend decision timeout");thread::sleep(Duration::from_millis(5));}}
     let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("isolated output")?).join("backend-choice");let fixture=Fixture::new(&output)?;
     let instance=OsString::from(format!("ZSDesk.NoEngine.{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)));
-    let _instance=Environment::set("ZSDESK_EVERYTHING_INSTANCE",&instance);let _bundle=Environment::set("ZSDESK_EVERYTHING_BUNDLE",fixture.root.join("missing/Everything.exe").as_os_str());
+    let _instance=Environment::set("ZSDESK_EVERYTHING_INSTANCE",&instance);
     let _data=Environment::set("ZSDESK_EVERYTHING_DATA_ROOT",fixture.root.join("everything-data").as_os_str());
     let profile=fixture.root.join("explorer-session.json");let mut session=crate::storage::default_session();session.ui.search_backend=BackendPreference::Everything;crate::storage::save(&profile,&session)?;
     let service=FastSearch::new_with_options(fixture.index.clone(),HWND::default(),0,SearchOptions::default())?;

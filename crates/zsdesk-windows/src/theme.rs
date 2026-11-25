@@ -125,6 +125,14 @@ pub fn high_contrast()->bool{
     unsafe { SystemParametersInfoW(SPI_GETHIGHCONTRAST, contrast.cbSize, Some((&mut contrast as *mut HIGHCONTRASTW).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) }.is_ok()
         && contrast.dwFlags.0 & 1 != 0
 }
+/// Window, window text, selection and selected text from the user's contrast theme.
+pub fn high_contrast_colors() -> Option<[[u8;3];4]> {
+    use windows::Win32::Graphics::Gdi::{GetSysColor,COLOR_WINDOW,COLOR_WINDOWTEXT,COLOR_HIGHLIGHT,COLOR_HIGHLIGHTTEXT};
+    high_contrast().then(|| [COLOR_WINDOW,COLOR_WINDOWTEXT,COLOR_HIGHLIGHT,COLOR_HIGHLIGHTTEXT].map(|role| {
+        let [r,g,b,_]=unsafe{GetSysColor(role)}.to_le_bytes();
+        [r,g,b]
+    }))
+}
 pub fn transparency_available() -> bool {
     if high_contrast(){return false;}
     let mut enabled = 1u32; let mut size = 4u32;

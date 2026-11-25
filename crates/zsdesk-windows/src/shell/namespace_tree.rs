@@ -106,12 +106,13 @@ fn system_libraries_visible() -> bool {
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct NamespaceTreeOptions {
+    pub show_libraries:Option<bool>,
     pub show_recycle_bin:bool,
     pub show_network:bool,
     pub expand_this_pc:Option<bool>,
 }
 impl Default for NamespaceTreeOptions {
-    fn default()->Self {Self{show_recycle_bin:true,show_network:true,expand_this_pc:None}}
+    fn default()->Self {Self{show_libraries:None,show_recycle_bin:true,show_network:true,expand_this_pc:None}}
 }
 
 thread_local! {
@@ -205,7 +206,7 @@ impl NamespaceTreeHost {
         let this_pc_style=options.expand_this_pc.map_or_else(||root_style(InitialRoot::ThisPc,initial),|expanded|
             (NSTCRS_VISIBLE.0 | if expanded{NSTCRS_EXPANDED.0}else{0})as u32);
         unsafe { tree.AppendRoot(&this_pc, enum_flags, this_pc_style, &filter)?; }
-        let libraries_visible = system_libraries_visible();
+        let libraries_visible = options.show_libraries.unwrap_or_else(system_libraries_visible);
         if libraries_visible {
             if let Ok(libraries) = unsafe { SHGetKnownFolderItem::<IShellItem>(&FOLDERID_Libraries, KF_FLAG_DEFAULT, None) } {
                 let _ = unsafe { tree.AppendRoot(&libraries, enum_flags, NSTCRS_VISIBLE.0 as u32, None) };
@@ -261,7 +262,7 @@ impl NamespaceTreeHost {
     }
     pub fn hwnd(&self) -> HWND { self.hwnd }
 
-    pub fn libraries_preference_changed(&self) -> bool { self.libraries_visible != system_libraries_visible() }
+    pub fn libraries_preference_changed(&self, preference: Option<bool>) -> bool { self.libraries_visible != preference.unwrap_or_else(system_libraries_visible) }
 
     /// Re-read display preferences without changing any Windows settings.
     pub fn refresh_metrics(&self) {

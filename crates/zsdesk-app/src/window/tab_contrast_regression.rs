@@ -37,13 +37,50 @@ fn render_tabs(gfx:&Gfx,palette:Palette,focused:bool,emphasis:bool,vertical:bool
             if active{
                 if legacy{
                     if vertical{cv.round(r,s(6.0),c(palette.layer));}else{cv.tab_shape(r,s(8.0),s(6.0),c(palette.layer));}
-                }else{paint_selected_tab(cv,r,vertical,dpi,style);}
+                }else{paint_selected_tab(cv,r,vertical,dpi,style,None);}
             }
             let text=if legacy{if focused{palette.text}else{palette.text_secondary}}else{style.text};
             cv.text(label,RectF::new(r.x+s(38.0),r.y,r.w-s(46.0),r.h),&TextStyle::ui(s(UI_TEXT)).weight(if legacy{400}else{style.weight}),c(text));
         }
     })?;Ok(surface)
 }
+#[test]
+fn custom_radius_changes_corners_and_command_icons_paint_at_each_scale()->Result<()> {
+    unsafe { OleInitialize(None) }?;
+    struct Apartment;
+    impl Drop for Apartment { fn drop(&mut self){unsafe{OleUninitialize();}} }
+    let _apartment=Apartment;
+    let gfx=Gfx::new("Segoe UI")?;
+    for dpi in [96,144,192] {
+        let scale=dpi as f32/96.;
+        let tab=RectF::new(8.*scale,8.*scale,80.*scale,28.*scale);
+        let appearance=Palette::light().tab_appearance(true,true,false).with_rgb([31,90,181]);
+        let render=|radius|->Result<Surface>{
+            let s=Surface::new((100.*scale)as i32,(44.*scale)as i32).context("tab surface")?;
+            gfx.draw(&s,|cv|{
+                cv.fill(RectF::new(0.,0.,100.*scale,44.*scale),Color::rgba8(255,255,255,255));
+                paint_selected_tab(cv,tab,false,dpi,appearance,Some(radius));
+            })?;
+            Ok(s)
+        };
+        let square=render(0)?;let rounded=render(12)?;
+        assert_ne!(pixel(&square,tab.x as i32+1,tab.y as i32+1),pixel(&rounded,tab.x as i32+1,tab.y as i32+1));
+        assert_eq!(pixel(&square,tab.x as i32+30,tab.y as i32+15),pixel(&rounded,tab.x as i32+30,tab.y as i32+15));
+        for &action in zsdesk_core::model::explorer::CommandBarItem::ALL.iter(){
+            let side=(16.*scale)as i32;
+            let s=Surface::new(side,side).context("command surface")?;
+            gfx.draw(&s,|cv|{
+                let white=Color::rgba8(255,255,255,255);
+                let rect=RectF::new(0.,0.,side as f32,side as f32);
+                cv.fill(rect,white);
+                zsdesk_windows::shell::menu::paint_command_icon(cv,rect,action,Color::rgba8(18,18,18,255),Color::rgba8(0,100,220,255),white);
+            })?;
+            assert!(pixels(&s).chunks_exact(4).any(|p|p[2]<150),"{action:?} at {dpi}");
+        }
+    }
+    Ok(())
+}
+
 fn pixels(surface:&Surface)->&[u8]{unsafe{std::slice::from_raw_parts(surface.bits,(surface.width*surface.height*4)as usize)}}
 
 #[test]

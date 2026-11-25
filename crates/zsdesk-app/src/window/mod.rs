@@ -100,6 +100,7 @@ const WM_LAYOUT: u32 = WM_APP + 2;
 pub(super) const WM_ACTION: u32 = WM_APP + 3;
 const WM_OPEN_REQUEST: u32 = WM_APP + 4;
 const TIMER_STATUS: usize = 1;
+const TIMER_PAINT_IDLE: usize = 0x5b32;
 const TIMER_MESSAGE: usize = 2;
 const TIMER_SEARCH: usize = 3;
 const TIMER_FAST_SEARCH:usize=4;
@@ -253,9 +254,17 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
         if pane_input::blank_double_click(&slot,&msg,&mut blank_clicks){continue;}
         if gestures.process(hwnd,&msg,&slot) { hover_preview.dismiss(&mut quick_preview);continue; }
         if mouse_navigation::pre_translate(hwnd,&msg){continue;}
+        if msg.hwnd == hwnd && msg.message == preview_process::ACTIVATE_ENTRY {
+            if let Some(path) = pane_preview.as_ref().and_then(|p| p.activation(&slot, msg.wParam.0, msg.lParam.0 as u64)) {
+                if path.is_dir() {
+                    if let Some(state) = slot.borrow_mut().as_mut() { unsafe { state.navigate_to(ShellLocation::Path(path)); } }
+                } else if path.is_file() { unsafe { zsdesk_windows::shell::open_path(hwnd,&path); } }
+            }
+            continue;
+        }
         if msg.hwnd==hwnd && msg.message==WM_TIMER && msg.wParam.0==preview_process::TIMER {
-            if let Some(dark)=slot.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|state.dark)){
-                for preview in [quick_preview.as_mut(),pane_preview.as_mut()].into_iter().flatten(){let _=preview.set_dark(dark);}
+            if let Some((dark,percent))=slot.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|(state.dark,state.session.ui.interface_text_percent))){
+                for preview in [quick_preview.as_mut(),pane_preview.as_mut()].into_iter().flatten(){let _=preview.set_dark(dark);let _=preview.set_text_percent(percent);}
             }
             for error in preview_process::poll_previews(&mut quick_preview,&mut pane_preview){
                 if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(error);}}
@@ -687,8 +696,11 @@ impl WindowState {
     fn position_children(&mut self) {
         self.position_picker();
         let dpi=self.interface_dpi();self.columns.position(self.font,dpi);
-        if self.columns.active{self.columns.fit_middle(self.layout.browser.width-self.s(24));}
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
+        if self.columns.active {
+            let gutter = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, self.dpi) } + self.s(12);
+            self.columns.fit_middle(self.layout.browser.width - gutter);
+        }
         self.position_other_pane();
         if let Some(tree) = &self.tree {
             let visible = self.session.ui.show_tree && !self.layout.tree.is_empty();
@@ -741,6 +753,17 @@ impl WindowState {
         self.position_children();
     }
 
+    fn set_text_percent(&mut self, percent:u16) {
+        let switch_renderer = (self.session.ui.interface_text_percent == 100) != (percent == 100);
+        self.session.ui.interface_text_percent = percent;
+        unsafe { self.update_font(); }
+        self.crumbs_for = None;
+        if switch_renderer {
+            self.native_theme_dark = None;
+            self.other_pane.native_theme_dark = None;
+            self.rebuild_color_scheme_views();
+        }
+    }
     unsafe fn update_font(&mut self) {
         zsdesk_windows::flyout::set_text_percent(self.hwnd,self.session.ui.interface_text_percent);
         let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
@@ -759,7 +782,7 @@ impl WindowState {
     fn apply_theme(&mut self) {
         let prefs=if crate::edition::THEMED {self.session.ui.appearance.clone()}
             else {zsdesk_core::model::explorer::AppearancePreferences::default()};
-        self.dark = theme::configure_color_scheme(prefs.color_scheme);
+        self.dark = theme::configure_color_scheme(self.session.ui.appearance.color_scheme);
         zsdesk_windows::flyout::refresh_system();
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
         if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
@@ -1191,9 +1214,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let settings=unsafe{*(data.lpData as*const u8)};if settings>1{return LRESULT(0);}
                 post(hwnd,WM_ACTION,if settings==1{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);return LRESULT(1);
             }
-            if data.dwData==crate::reveal::VERIFY_THIS_PC&&data.cbData==0{
+            if matches!(data.dwData,crate::reveal::VERIFY_THIS_PC|crate::reveal::VERIFY_RECYCLE_BIN)&&data.cbData==0{
                 let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
-                let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()&&matches!(state.current_location(),ShellLocation::ThisPc)));
+                let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()&&match (data.dwData,state.current_location()) {
+                    (crate::reveal::VERIFY_THIS_PC,ShellLocation::ThisPc)=>true,
+                    (crate::reveal::VERIFY_RECYCLE_BIN,ShellLocation::Shell{parsing_name,..})=>zsdesk_windows::shell::is_recycle_bin_name(parsing_name),
+                    _=>false,
+                }));
                 return LRESULT(accepted as isize);
             }
             if data.dwData==crate::reveal::VERIFY_TAG {
@@ -1437,6 +1464,7 @@ impl WindowState {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = unsafe { BeginPaint(self.hwnd, &mut ps) };
                 self.paint_update(dc,ps.rcPaint);
+                if self.surface.is_some(){unsafe {SetTimer(Some(self.hwnd),TIMER_PAINT_IDLE,zsdesk_windows::gfx::PAINT_IDLE_MS,None);}}
                 let _ = unsafe { EndPaint(self.hwnd, &ps) };
             }
             WM_SIZE => {unsafe { self.resize();SetTimer(Some(self.hwnd),TIMER_PLACEMENT,300,None); }},
@@ -1464,7 +1492,7 @@ impl WindowState {
             WM_SETTINGCHANGE => {
                 let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default() } else { String::new() };
                 if theme_setting_changed(wp,lp) {self.refresh_system_theme();self.icons.clear();}
-                if self.tree.as_ref().is_some_and(NamespaceTreeHost::libraries_preference_changed) {
+                if self.tree.as_ref().is_some_and(|tree|tree.libraries_preference_changed(self.session.ui.navigation_show_libraries)) {
                     self.rebuild_navigation_tree();
                 } else if let Some(tree) = &self.tree { tree.refresh_metrics(); }
                 if area == "ShellState" || area.is_empty() { self.invalidate(); }
@@ -1476,6 +1504,11 @@ impl WindowState {
                 if wp.0==deferred_selection::TIMER{self.poll_pane_selections();}
                 if wp.0==rename_follow::TIMER{self.poll_rename_follow();}
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
+                if wp.0 == TIMER_PAINT_IDLE {
+                    let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PAINT_IDLE)};
+                    self.release_idle_graphics();
+                    zsdesk_windows::gfx::reclaim_unused_heap_pages();
+                }
                 if wp.0 == TIMER_STATUS { self.update_shell_registry();self.refresh_status();self.poll_search_settings();self.poll_pane_searches();self.poll_folder_sizes(); }
                 if wp.0 == TIMER_FOLDER_SIZES{self.poll_folder_sizes_inner();}
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
@@ -1551,6 +1584,7 @@ impl WindowState {
                 return Some(LRESULT(0));
             }
             column_browser::READY => { self.column_results(); return Some(LRESULT(0)); }
+            WM_COMMAND if self.columns.activate_file(wp,lp) => return Some(LRESULT(0)),
             WM_COMMAND if self.columns.is_selection(wp,lp) => {self.column_selection();return Some(LRESULT(0));}
             WM_COMMAND => {
                 let id = wp.0 & 0xFFFF;
@@ -1599,11 +1633,18 @@ impl WindowState {
                 pane_input::invalidate_blank_clicks(self.hwnd);
                 self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
                 self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
+                if self.session.ui.navigation_show_libraries != saved.ui.navigation_show_libraries {
+                    self.session.ui.navigation_show_libraries = saved.ui.navigation_show_libraries;
+                    self.rebuild_navigation_tree();
+                }
                 self.session.ui.right_click_close_tab = saved.ui.right_click_close_tab;
                 if self.session.ui.bookmark_display!=saved.ui.bookmark_display||self.session.ui.navigation_divider!=saved.ui.navigation_divider||self.session.ui.interface_text_percent!=saved.ui.interface_text_percent{
                     unsafe{self.commit_bookmark_rename();}self.session.ui.bookmark_display=saved.ui.bookmark_display;self.session.ui.navigation_divider=saved.ui.navigation_divider;
-                    if self.session.ui.interface_text_percent!=saved.ui.interface_text_percent{self.session.ui.interface_text_percent=saved.ui.interface_text_percent;unsafe{self.update_font();}self.crumbs_for=None;}
+                    if self.session.ui.interface_text_percent!=saved.ui.interface_text_percent{self.set_text_percent(saved.ui.interface_text_percent);}
                     self.measure_bookmarks();unsafe{self.resize();}self.invalidate();
+                }
+                if self.session.ui.tab_style!=saved.ui.tab_style {
+                    self.session.ui.tab_style=saved.ui.tab_style;self.invalidate();
                 }
                 if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
                     self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();

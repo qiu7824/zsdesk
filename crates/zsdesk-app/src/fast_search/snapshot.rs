@@ -10,6 +10,12 @@ const FILTER_REVISION:u32=1;
 const MAX_BYTES:u64=2*1024*1024*1024;
 pub struct Policy{pub development:bool,pub metadata:bool}
 impl Policy{pub(super) fn bits(&self)->u32{u32::from(self.development)|(u32::from(self.metadata)<<1)|(FILTER_REVISION<<8)}}
+#[derive(Debug)]
+pub(super) struct PolicyChanged;
+impl std::fmt::Display for PolicyChanged {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.write_str("索引选项已改变，需要重新建立") }
+}
+impl std::error::Error for PolicyChanged {}
 struct HashWriter{file:File,hash:Sha256,bytes:u64}
 impl Write for HashWriter{
     fn write(&mut self,bytes:&[u8])->io::Result<usize>{if self.bytes+bytes.len()as u64>MAX_BYTES{return Err(io::Error::other("索引快照超过 2 GiB 容量"));}
@@ -41,11 +47,19 @@ fn read_bytes(reader:&mut impl Read,remaining:&mut u64,max:usize)->Result<Vec<u8
 }
 pub fn save(path:&Path,policy:&Policy,volumes:&[VolumeIndex],cancel:&impl Fn()->bool)->Result<()>{
     ensure!(path.is_absolute()&&volumes.len()<=128,"快照路径或卷数量无效");let parent=path.parent().context("快照目录缺失")?;fs::create_dir_all(parent)?;
-    let temporary=path.with_extension(format!("{}.tmp",std::process::id()));
+    use std::{os::windows::fs::OpenOptionsExt, sync::atomic::{AtomicU64,Ordering}};
+    static NEXT:AtomicU64=AtomicU64::new(0);
+    let (temporary,file)=loop {
+        let sequence=NEXT.fetch_add(1,Ordering::Relaxed);
+        let candidate=path.with_extension(format!("{}-{sequence}.tmp",std::process::id()));
+        match OpenOptions::new().create_new(true).write(true).share_mode(0).open(&candidate) {
+            Ok(file)=>break (candidate,file),
+            Err(e) if e.kind()==io::ErrorKind::AlreadyExists=>continue,
+            Err(e)=>return Err(e).context("无法创建临时索引文件"),
+        }
+    };
     struct Temporary<'a>(&'a Path);impl Drop for Temporary<'_>{fn drop(&mut self){let _=fs::remove_file(self.0);}}
     let _temporary=Temporary(&temporary);
-    use std::os::windows::fs::OpenOptionsExt;
-    let file=OpenOptions::new().create(true).truncate(true).write(true).share_mode(0).open(&temporary)?;
     let mut writer=BufWriter::with_capacity(1024*1024,HashWriter{file,hash:Sha256::new(),bytes:0});
     writer.write_all(MAGIC)?;scalar(&mut writer,policy.bits())?;scalar(&mut writer,volumes.len()as u32)?;
     for volume in volumes{
@@ -74,16 +88,16 @@ pub fn save(path:&Path,policy:&Policy,volumes:&[VolumeIndex],cancel:&impl Fn()->
     }
     writer.flush()?;let mut writer=writer.into_inner().map_err(|e|e.into_error())?;let digest=writer.hash.finalize();writer.file.write_all(&digest)?;writer.file.sync_all()?;drop(writer.file);
     ensure!(!cancel(),"快照保存已取消");
-    use windows::{core::PCWSTR,Win32::Storage::FileSystem::{MoveFileExW,MOVEFILE_REPLACE_EXISTING}};
-    let from:Vec<_>=temporary.as_os_str().encode_wide().chain(Some(0)).collect();let to:Vec<_>=path.as_os_str().encode_wide().chain(Some(0)).collect();
-    unsafe{MoveFileExW(PCWSTR(from.as_ptr()),PCWSTR(to.as_ptr()),MOVEFILE_REPLACE_EXISTING)}?;Ok(())
+    // Windows can keep the old file mapped during a query. std::fs::rename
+    // also supports POSIX replacement semantics for those readers on NTFS.
+    fs::rename(&temporary,path).context("无法替换搜索索引")
 }
 pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<VolumeIndex>>{
     use std::os::windows::fs::MetadataExt;
     let metadata=fs::symlink_metadata(path)?;ensure!(metadata.is_file()&&metadata.file_attributes()&0x400==0,"快照必须为普通文件");
     let size=metadata.len();ensure!((48..=MAX_BYTES+32).contains(&size),"快照大小无效");let file=File::open(path)?;
     let mut reader=BufReader::with_capacity(1024*1024,HashReader{input:file.take(size-32),hash:Sha256::new()});
-    let mut magic=[0u8;8];reader.read_exact(&mut magic)?;let legacy=&magic==LEGACY_MAGIC;ensure!(legacy||&magic==MAGIC,"快照版本不兼容");ensure!(read_scalar::<u32>(&mut reader)?==policy.bits(),"索引选项已改变，需要重新建立");
+    let mut magic=[0u8;8];reader.read_exact(&mut magic)?;let legacy=&magic==LEGACY_MAGIC;ensure!(legacy||&magic==MAGIC,"快照版本不兼容");if read_scalar::<u32>(&mut reader)?!=policy.bits(){return Err(PolicyChanged.into());}
     let count=read_scalar::<u32>(&mut reader)?;ensure!(count<=128,"快照卷数量无效");let mut remaining=size-32;let mut volumes=Vec::new();let mut total=0;
     for _ in 0..count{
         let root=std::path::PathBuf::from(OsString::from_wide(&read_column::<u16>(&mut reader,&mut remaining,32768,cancel)?));ensure!(root.is_absolute(),"快照根目录必须为绝对路径");
@@ -149,7 +163,9 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
             let page=search::mapped::search(&path,&options,&req,&cancel)?;
             assert_eq!(page.total,2);assert_eq!(page.paths[0],Path::new(r"C:\K"));
             assert_eq!(page.paths[1].file_name().unwrap().encode_wide().collect::<Vec<_>>(),[0xd800]);
-            let volumes=load(&path,&policy,&cancel)?;save(&path,&policy,&volumes,&cancel)?;
+            let volumes=load(&path,&policy,&cancel)?;
+            let _reader=search::mapped::hold_snapshot(&path,&options)?;
+            save(&path,&policy,&volumes,&cancel)?;
         }
         let mut damaged=fs::read(&path)?;damaged[20]^=1;fs::write(&path,damaged)?;
         assert!(search::mapped::search(&path,&options,&req,&cancel).is_err());

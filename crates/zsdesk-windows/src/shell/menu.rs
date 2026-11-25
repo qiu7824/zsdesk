@@ -73,6 +73,7 @@ mod menu_catalog;
 pub use menu_catalog::{MenuCatalogItem,catalog_item_hidden};
 #[path="drawn_menu.rs"]
 mod drawn_menu;
+pub use drawn_menu::paint_command_icon;
 #[path="menu_target.rs"]
 mod menu_target;
 pub use menu_target::ViewMenuTarget;
@@ -1039,6 +1040,16 @@ unsafe extern "system" fn view_menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
     }
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let state = unsafe { &*(data as *const ViewMenuState) };
+    if msg==windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY && lp.0!=0 {
+        use windows::Win32::UI::{Controls::{NMHDR,LVN_BEGINDRAG},Shell::IResultsFolder};
+        let header=unsafe{&*(lp.0 as *const NMHDR)};
+        if header.code==LVN_BEGINDRAG && state.view.cast::<IFolderView2>().and_then(|folder|unsafe{folder.GetFolder::<IResultsFolder>()}).is_ok() {
+            let view=state.view.clone();
+            if let Ok(paths)=super::file_transfer::selected_paths(&view) {
+                if !paths.is_empty() && super::file_transfer::drag_paths(hwnd,&paths).is_ok(){return LRESULT(0);}
+            }
+        }
+    }
     if msg==WM_CONTEXTMENU{
         let source=HWND(wp.0 as*mut _);
         if control_owns_context_menu(hwnd,source){return unsafe{DefSubclassProc(hwnd,msg,wp,lp)};}

@@ -337,7 +337,6 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     crate::context_menu_process::shutdown_idle_worker();
     crate::window::diagnostics::flush_at_shutdown();
     ingress.tray.borrow_mut().remove();drop(window);drop(ingress);
-    if let Err(error)=crate::fast_search::everything::shutdown_managed_if_unused(){trace(&format!("Everything shutdown: {error:#}"));}
     if let Some(error)=last_error{bail!("{error}");}Ok(())
 }
 

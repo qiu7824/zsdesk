@@ -10,7 +10,8 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 
 ## 版本
 
-当前版本为 0.4.3。
+当前版本为 0.4.7。全新安装可选择全量版离线安装包（文件名以 -full-x64-offline-setup.exe 结尾）；此包提供 ZSDesk 自带搜索、网络与桌面组件，使用 Windows Installer 安装。已有 Inno 安装请选择文件名以 -full-x64-setup.exe 结尾的安装包原位升级。
+x64 安装程序要求 Windows 10 1809（17763）或更高版本。
 
 界面支持简体中文和 English；非中文 Windows 系统默认使用英文。“≡ → 语言 / Language”可选择跟随系统或指定语言，选择后立即切换。文件名称与系统 Shell 文本保持原值。
 
@@ -45,6 +46,10 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 - 命令栏和空白右键的新建使用系统 ShellNew 模板，创建后自动选中并进入重命名；空白菜单的查看、排序和刷新作用于当前栏。
 - 复制、移动保留系统冲突确认与进度窗口，完成、取消和部分跳过会在状态栏分别反馈。
 - “排序 → 计算并按总大小排序”可在原文件列表中按文件和文件夹总大小排序；内置计算无需额外搜索引擎，未知大小与空文件夹分开显示。
+- “≡ → 标签页”可设置圆角，并为当前标签和其他标签分别选择颜色；“恢复主题配色”可回到主题默认值。
+- 在详细信息视图中，打开“查看 → 详细信息列”可分别显示创建时间和修改时间。
+- 多栏浏览的右侧预览支持双击目录进入、双击文件打开。双击文件夹预览标题或列表空白处可进入正在预览的文件夹。
+- 快速搜索和文件窗口搜索均提供“其他”类型筛选。输入 ext:dwg 可按指定扩展名查找，ext:dwg;dxf 同时查找两种格式。
 - 文件夹、回收站、此电脑、网络及控制面板使用系统显示名称。
 - 界面遵循系统缩放；Windows 11 22H2 及以上支持 Mica 和系统窗口按钮。
 
@@ -59,7 +64,7 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 右下角同时保留详细信息与缩略图切换按钮。关闭某栏最后一个标签时保留另一栏，
 关闭窗口最后一个标签时默认关闭文件窗口，可在“≡ → 标签页”中改回保留空标签。
 
-“≡ → 布局 → 导航窗格选项”提供回收站、网络导航项的显隐，以及“此电脑”启动时展开、折叠或跟随起始位置。
+“≡ → 布局 → 导航窗格选项”提供库、回收站和网络导航项的显隐，以及“此电脑”启动时展开、折叠或跟随起始位置。
 Windows 10 保留 Shell 导航控件的默认尺寸；Windows 11 的导航行距随系统紧凑模式、显示缩放和当前字体调整，缩进由 Shell 处理。
 普通文件夹的查看方式、图标大小、排序、分组及列设置由 Shell 按文件夹保存，并按 ZSDesk 配置目录隔离；未设置的目录继承系统文件夹模板。
 标签页另行保存选区与浏览位置，搜索结果和临时菜单宿主不覆盖普通文件夹的视图偏好。
@@ -116,26 +121,14 @@ UNC 网络共享和已有映射网络目录在当前范围内遍历搜索，不�
 自带搜索支持通配符、引号、`<…>` 分组、`|`、`!`、`ext:`、`file:`、`folder:` 和 `path:`；
 其他 Everything 专用语法会提示切换后端，不会被当作普通关键词悄悄执行。
 
-Everything 是可选兼容后端。标准版、网络版、桌面版、全量版和主题版随包提供
-官方 Everything 1.4.1.1032 x64 非 Lite 引擎，也可在“≡ → 搜索 → 选择已安装的 Everything…”中指定程序。
-指定来源显示勾选，可恢复自动选择；“搜索引擎状态…”显示保存的程序路径、实际连接实例、索引就绪和系统服务状态，并自动刷新。
-保存程序路径不表示已建立连接，首次搜索时连接或启动；状态窗口区分已配置、未连接、索引加载、就绪和不可用。
-只有选择 Everything 后才会按需连接或启动索引进程，普通列表查询通过 Unicode IPC 分页读取结果路径。
+默认使用 ZSDesk 自带搜索。已自行安装 Everything 的用户可在“≡ → 搜索 → 选择已安装的 Everything…”中指定程序，并使用其索引。切换到自带搜索可保留该路径；“解除 Everything 绑定”清除路径并切回自带搜索。Everything 的索引范围、服务与更新由用户在 Everything 中管理。“搜索引擎状态…”可查看已选路径、连接和索引状态。
 
-Everything 的快速全盘 NTFS 索引需要兼容服务或管理员权限。未安装服务时，可在
-“≡ → 搜索 → 启用快速索引服务…”中授权启用 ZSDesk 专用服务。
-普通权限下既没有兼容服务，也没有已配置可用索引时，搜索会提示设置；不会静默退回到遍历所有磁盘。
-索引正在加载或建立时显示进度，就绪后自动执行查询，未就绪状态不会当作零结果。
-索引范围、包含和排除规则由 Everything 管理，
-未纳入其索引的位置不会出现在搜索结果中。
 “≡ → 搜索 → 显示文件夹大小”默认关闭。开启后，普通文件夹可显示文件与文件夹的逻辑总大小，并在原列表中排序。
 选择 Everything 且已有可用大小索引时优先读取索引；否则在后台只读计算，逐项显示完成结果，不建立额外文件名索引。
 空文件夹显示零，未能完整读取的项目保持未知；不跟随目录链接，不修改文件内容或文件属性。
 目录变化会触发更新，双栏分别保留排序与选中项，关闭开关恢复原生大小列及列宽。
 每个视图最多计算 32,768 个项目，并限制项目快照占用；超过范围会说明原因并保留原生显示。
 搜索结果、库和虚拟视图保留原生表现；“排序 → 文件夹大小概览…”提供独立概览。
-Everything 保留原始程序和许可，位于 `engines/everything/`；发行包不包含 `.ini`、`.db` 或个人搜索数据。
-Everything 后端需要保留完整引擎目录或指定可用程序；自带搜索不依赖 Everything。
 桌面盒子独立版不提供文件名搜索，也不附带 Everything。
 
 “≡ → 系统集成 → 开机启动与全局快捷键…”分别设置主窗口、后台快捷键和桌面格子的登录启动；全局快捷键默认为 `Ctrl+Alt+Space`。
@@ -248,7 +241,7 @@ ZSDesk.exe --import-tencent - --import-report "C:\Reports\layout.json" --apply-i
 ## 文件夹与应用接入
 
 “≡ → 系统集成”提供不接管（按备份恢复系统设置）、增加右键入口和默认打开文件夹和磁盘。
-操作仅涉及当前用户注册表；“此电脑”可由 ZSDesk 打开，其他系统虚拟文件夹保持原有默认处理方式。
+设置保存在当前用户注册表中。启用默认接管后，桌面上的“此电脑”和“回收站”也由 ZSDesk 打开。
 默认接管同时登记文件夹和磁盘的 `open`、`explore` 动作，保存原始处理程序与隐藏标志，恢复时保留其他程序后续写入的设置。
 运行中的默认配置通过标准 Shell 打开会话接收目录请求；WPS 文档标签的“打开文件位置”可创建目录标签并选中目标文件。
 每个文件窗口的已完成导航标签登记到系统窗口集合，双栏分别登记；系统文件定位请求在对应窗格选中项目，Explorer 重启后重新登记。
@@ -305,9 +298,6 @@ ZSDesk.exe --import-tencent - --import-report "C:\Reports\layout.json" --apply-i
 验证工具链为 Rust 1.99.0。打包使用 PowerShell 7，安装器需要 Inno Setup 6.3 或更新版本。
 构建需要 Rust 1.89 或更新版本；持续集成使用 Rust 1.99。
 VC Runtime 从 Visual Studio x64 Redist 目录获取。
-Everything 使用固定版本的官方便携分发文件，来源与 SHA-256 记录在
-`packaging/engines/everything.json`。`-EverythingDir` 指向包含原始程序、语言包、完整许可及该清单的目录。
-
 ZSUI 按需启用原生窗口、虚拟列表、输入和快捷键等功能。其固定源码版本记录于
 `packaging/zsui-revision.txt`，位于本仓库的同级 `zsui/` 目录。
 
@@ -333,16 +323,13 @@ cargo build --release --locked -p zsdesk-app --no-default-features --features de
 # 转发组件与六个发行版本
 ./native/routing/build.ps1 -OutputDir 'C:\Build\ZSDesk-routing' -BuildDir 'C:\Build\ZSDesk-routing-build'
 ./scripts/package.ps1 -WorkDir 'C:\Build\ZSDesk-package' -TargetDir $env:CARGO_TARGET_DIR `
-    -RoutingDir 'C:\Build\ZSDesk-routing' -EverythingDir 'C:\Build\Everything-1.4.1.1032-x64' `
+    -RoutingDir 'C:\Build\ZSDesk-routing' `
     -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
 ```
 
 打包器验证程序版本与 feature 身份，生成文件哈希清单，移除本机编译路径信息；
 已有发行目录不会被静默覆盖。`-Editions full,desktop` 可选择部分版本，
 `-RuntimeDir` 可指定 Visual Studio Redist 下的 CRT 目录。
-打包器逐项校验 Everything 的官方文件哈希与资源版本，仅复制固定的四个分发文件。
 
 项目代码使用 [MIT](../LICENSE)；ZSUI 使用 MPL-2.0，MinHook 使用 BSD-2-Clause。
-Everything 及其 PCRE 组件的版权和完整许可见
-[Everything-1.4.1.1032-License.txt](../packaging/licenses/Everything-1.4.1.1032-License.txt)。
 其余组件声明见 [packaging/licenses/NOTICE.txt](../packaging/licenses/NOTICE.txt)。

@@ -5,13 +5,31 @@ mod native_scan;
 mod snapshot;
 pub(crate) mod mapped;
 pub(crate) mod query;
+
+/// Includes generated scope paths and file-type restrictions around the input.
+pub(crate) const MAX_EXPRESSION_CHARS:usize = 8192;
+pub(crate) mod file_types {
+    macro_rules! extensions {
+        ($($name:ident = $values:literal),+) => {
+            $(pub const $name: &str = concat!("ext:", $values);)+
+            pub const OTHER: &str = concat!("file:", $(" !ext:", $values),+);
+        };
+    }
+    extensions!(
+        DOCUMENTS = "doc;docx;docm;xls;xlsx;xlsm;ppt;pptx;pptm;pdf;txt;rtf;md;csv;odt;ods;odp;wps;et;dps",
+        IMAGES = "jpg;jpeg;png;gif;bmp;webp;heic;heif;avif;tif;tiff;svg;ico;raw;cr2;nef;arw;psd",
+        VIDEOS = "mp4;mkv;avi;mov;wmv;flv;webm;m4v;mpg;mpeg;ts;m2ts;3gp",
+        AUDIO = "mp3;wav;flac;aac;m4a;ogg;opus;wma;aiff;ape;alac;mid;midi"
+    );
+}
+
 mod native;
 pub(crate) mod network;
 #[cfg(test)]#[path="fast_search/runtime_regression.rs"]mod runtime_regression;
 pub(crate) mod everything;
 pub use zsdesk_core::model::explorer::SearchBackendPreference as BackendPreference;
 use std::{collections::HashMap,ffi::{OsStr,OsString},fs,os::windows::ffi::{OsStrExt,OsStringExt},path::{Path,PathBuf},
-    sync::{Arc,Weak,Mutex,Condvar,OnceLock,RwLock,atomic::{AtomicBool,AtomicU64,Ordering},mpsc::{self,Receiver,SyncSender,TrySendError}},
+    sync::{Arc,Weak,Mutex,Condvar,OnceLock,atomic::{AtomicBool,AtomicU64,Ordering},mpsc::{self,Receiver,SyncSender,TrySendError}},
     thread::{self,JoinHandle},time::{Duration,Instant}};
 use anyhow::{Result,Context,bail,ensure};
 use windows::{core::PCWSTR,Win32::{Foundation::{HWND,LPARAM,WPARAM},Storage::FileSystem::{GetDriveTypeW,GetLogicalDriveStringsW},UI::WindowsAndMessaging::PostMessageW}};
@@ -67,8 +85,6 @@ impl Shared{
 }
 type Registry=HashMap<PathBuf,Vec<Weak<Shared>>>;
 static CLIENTS:OnceLock<Mutex<Registry>>=OnceLock::new();
-static EVERYTHING_ACTIVITY:RwLock<()>=RwLock::new(());
-pub(super) fn everything_activity()->std::sync::RwLockReadGuard<'static,()>{EVERYTHING_ACTIVITY.read().unwrap_or_else(|e|e.into_inner())}
 pub fn require_everything(profile:&Path)->Result<()>{
     ensure!(crate::storage::load(profile)?.ui.search_backend==BackendPreference::Everything,"当前选择自带搜索；Everything 不会自动启动，请在搜索设置中切换后端");Ok(())
 }
@@ -78,14 +94,7 @@ pub fn settings_changed(profile:&Path){
             client.engine_stop.store(true,Ordering::Release);client.generation.fetch_add(1,Ordering::AcqRel);
             let mut control=client.control.lock().unwrap_or_else(|e|e.into_inner());client.query_active.store(false,Ordering::Release);client.clear_page();control.request=None;control.settings_changed=true;control.release_idle=true;drop(control);client.wake.notify_all();true});}
     }
-    let profile=profile.to_path_buf();
-    let _=thread::Builder::new().name("zsdesk-search-release".into()).spawn(move||{
-        let _activity=EVERYTHING_ACTIVITY.write().unwrap_or_else(|e|e.into_inner());
-        if require_everything(&profile).is_ok(){return;}
-        let peers=CLIENTS.get().map(|clients|clients.lock().unwrap_or_else(|e|e.into_inner()).iter().filter(|(_,clients)|clients.iter().any(|c|c.strong_count()>0)).map(|(path,_)|path.clone()).collect::<Vec<_>>()).unwrap_or_default();
-        if peers.iter().any(|path|require_everything(path).is_ok()){return;}
-        let _=everything::shutdown_managed_if_unused();
-    });
+
 }
 
 pub struct FastSearch{shared:Arc<Shared>,events:Receiver<SearchEvent>,worker:Option<JoinHandle<()>>}
@@ -143,7 +152,7 @@ impl FastSearch{
     pub fn start(&self,query:&str,preferred:Option<PathBuf>)->u64{self.start_page(query,preferred,0,2000,everything::SearchSort::NameAsc)}
     pub fn start_page(&self,query:&str,preferred:Option<PathBuf>,offset:u32,limit:u32,sort:everything::SearchSort)->u64{
         let generation=self.shared.generation.fetch_add(1,Ordering::AcqRel)+1;network::cancel(&self.shared);self.discard_events();
-        let text:String=query.trim().chars().take(513).collect();let invalid=if text.chars().count()>512||text.contains('\0'){Some("搜索内容过长或包含无效字符".into())}else{None};
+        let text:String=query.trim().chars().take(MAX_EXPRESSION_CHARS+1).collect();let invalid=if text.chars().count()>MAX_EXPRESSION_CHARS||text.contains('\0'){Some("搜索内容过长或包含无效字符".into())}else{None};
         let mut control=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());control.release_idle=text.is_empty();
         control.request=(!text.is_empty()).then(||Request{generation,query:text,preferred,invalid,offset,limit:limit.clamp(1,2000),sort});
         self.shared.query_active.store(control.request.is_some(),Ordering::Release);self.shared.engine_stop.store(control.request.is_none(),Ordering::Release);drop(control);self.shared.wake.notify_all();generation

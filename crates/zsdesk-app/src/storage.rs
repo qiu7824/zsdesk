@@ -178,8 +178,8 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let saved=if path.try_exists()?{Some(load(path)?)}else{None};let mut next=session.clone();
     if let Some(saved)=&saved {next.ui.folder_layouts.clone_from(&saved.ui.folder_layouts);next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
-        next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;
-        next.ui.bookmark_display=saved.ui.bookmark_display;next.ui.navigation_divider=saved.ui.navigation_divider;next.ui.interface_text_percent=saved.ui.interface_text_percent;
+        next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;next.ui.tab_style=saved.ui.tab_style;
+        next.ui.bookmark_display=saved.ui.bookmark_display;next.ui.navigation_divider=saved.ui.navigation_divider;next.ui.navigation_show_libraries=saved.ui.navigation_show_libraries;next.ui.interface_text_percent=saved.ui.interface_text_percent;
         next.ui.right_click_close_tab=saved.ui.right_click_close_tab;
         next.ui.single_click_blank_up=saved.ui.single_click_blank_up;
         next.ui.double_click_blank_up=saved.ui.double_click_blank_up;}
@@ -369,12 +369,17 @@ mod tests {
         let root=std::env::temp_dir().join(format!("zsdesk-tab-emphasis-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
         fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");let original=default_session();
         assert!(!original.ui.tab_selection_emphasis);save(&path,&original).unwrap();
-        let mut legacy=serde_json::to_value(&original).unwrap();legacy["ui"].as_object_mut().unwrap().remove("tab_selection_emphasis");
+        let mut legacy=serde_json::to_value(&original).unwrap();legacy["ui"].as_object_mut().unwrap().remove("tab_selection_emphasis");legacy["ui"].as_object_mut().unwrap().remove("tab_style");
         fs::write(&path,serde_json::to_vec(&legacy).unwrap()).unwrap();assert!(!load(&path).unwrap().ui.tab_selection_emphasis);
         assert!(toggle_tab_preference(&path, |ui| &mut ui.tab_selection_emphasis).unwrap());
         assert!(toggle_tab_preference(&path, |ui| &mut ui.right_click_close_tab).unwrap());
         save_window_with_search(&path,&original,false,&original.ui.search_preferences()).unwrap();
         let saved=load(&path).unwrap();assert!(saved.ui.tab_selection_emphasis);assert_eq!(saved.tabs,original.tabs);
+        assert_eq!(saved.ui.navigation_show_libraries,None);
+        let style=zsdesk_core::model::explorer::TabStyle{radius:Some(0),selected_color:Some([30,40,50]),inactive_color:Some([210,210,230])};
+        update_shared_ui(&path,|ui|{ui.tab_style=style;ui.navigation_show_libraries=Some(false);}).unwrap();
+        save_window_with_search(&path,&original,false,&original.ui.search_preferences()).unwrap();
+        let stored=load(&path).unwrap();assert_eq!(stored.ui.tab_style,style);assert_eq!(stored.ui.navigation_show_libraries,Some(false));
         assert!(saved.ui.right_click_close_tab);
         assert!(!toggle_tab_preference(&path, |ui| &mut ui.tab_selection_emphasis).unwrap());
         assert!(load(&path).unwrap().ui.right_click_close_tab);

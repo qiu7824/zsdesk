@@ -99,18 +99,30 @@ impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}
 #[derive(Clone)]
 struct Snapshot{window:HWND,pid:u32,folder:PathBuf,selected:Vec<PathBuf>,browser:IWebBrowser2,this_pc:bool}
 impl Snapshot{
+    fn namespace(&self)->Option<zsdesk_core::model::explorer::ShellLocation>{
+        use zsdesk_core::model::explorer::ShellLocation;
+        if self.this_pc { return Some(ShellLocation::ThisPc); }
+        zsdesk_windows::shell::is_recycle_bin_name(&self.folder.to_string_lossy()).then(||ShellLocation::Shell {
+            parsing_name:"shell:RecycleBinFolder".into(), title:zsdesk_core::i18n::text("回收站").into(), pidl:None
+        })
+    }
+    fn open_tag(&self)->usize{
+        if self.namespace().is_some() {crate::instance::OPEN_MAGIC} else {crate::reveal::COPYDATA_TAG}
+    }
+    fn verification<'a>(&self, bytes:&'a [u8])->(usize,&'a [u8]){
+        if self.this_pc { (crate::reveal::VERIFY_THIS_PC,&[]) }
+        else if self.namespace().is_some() { (crate::reveal::VERIFY_RECYCLE_BIN,&[]) }
+        else { (crate::reveal::VERIFY_TAG,bytes) }
+    }
     fn same_location(&self,other:&Self)->bool{self.window==other.window&&self.pid==other.pid&&self.this_pc==other.this_pc&&same_path(&self.folder,&other.folder)}
     fn equivalent(&self,other:&Self)->bool{self.window==other.window&&self.pid==other.pid&&self.this_pc==other.this_pc&&same_path(&self.folder,&other.folder)
         && self.selected.len()==other.selected.len()&&self.selected.iter().all(|a|other.selected.iter().any(|b|same_path(a,b)))}
 }
-struct Snapshots{views:Vec<Snapshot>,multiple:HashSet<isize>,recycle_bins:HashSet<isize>}
+struct Snapshots{views:Vec<Snapshot>,multiple:HashSet<isize>}
 fn read_snapshot(browser:&IWebBrowser2,window:HWND,pid:u32)->windows::core::Result<Snapshot>{
     let view=unsafe{browser.Document()?}.cast::<IShellFolderViewDual>()?;
     let folder=unsafe{view.Folder()?}.cast::<Folder2>()?;
     let folder=PathBuf::from(unsafe{folder.Self_()?.Path()?}.to_string());
-    if zsdesk_windows::shell::is_recycle_bin_name(&folder.to_string_lossy()){
-        return Ok(Snapshot{window,pid,folder,selected:Vec::new(),browser:browser.clone(),this_pc:false});
-    }
     let items=unsafe{view.SelectedItems()?};let count=unsafe{items.Count()?};
     if !(0..=128).contains(&count){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)));}
     let mut selected=Vec::with_capacity(count as usize);
@@ -122,7 +134,7 @@ fn snapshots(shell:&IShellWindows)->Result<Snapshots>{
     snapshots_for(shell,None)
 }
 fn snapshots_for(shell:&IShellWindows,requested:Option<&HashSet<isize>>)->Result<Snapshots>{
-    let mut result=Vec::new();let mut counts=HashMap::new();let mut recycle_bins=HashSet::new();
+    let mut result=Vec::new();let mut counts=HashMap::new();
     for index in 0..unsafe{shell.Count()?}.clamp(0,128){
         let Ok(dispatch)=(unsafe{shell.Item(&VARIANT::from(index))})else{continue;};
         let Ok(browser)=dispatch.cast::<IWebBrowser2>()else{continue;};
@@ -136,12 +148,12 @@ fn snapshots_for(shell:&IShellWindows,requested:Option<&HashSet<isize>>)->Result
         let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}if pid==0{continue;}
         let snapshot=read_snapshot(&browser,window,pid);
         if let Ok(snapshot)=snapshot{
-            if zsdesk_windows::shell::is_recycle_bin_name(&snapshot.folder.to_string_lossy()){recycle_bins.insert(window.0 as isize);}
-            else if (snapshot.this_pc&&snapshot.selected.is_empty())||(snapshot.folder.is_absolute()&&snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}
+            if (snapshot.namespace().is_some() && snapshot.selected.is_empty()) ||
+                (snapshot.folder.is_absolute() && snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}
         }
     }
     let multiple=counts.iter().filter_map(|(window,count)|(*count>1).then_some(*window)).collect();
-    result.retain(|snapshot|counts.get(&(snapshot.window.0 as isize))==Some(&1));Ok(Snapshots{views:result,multiple,recycle_bins})
+    result.retain(|snapshot|counts.get(&(snapshot.window.0 as isize))==Some(&1));Ok(Snapshots{views:result,multiple})
 }
 #[cfg(test)]fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{Ok(snapshots(shell)?.views)}
 fn find_target(profile:&Path)->Option<HWND>{
@@ -157,8 +169,7 @@ fn send_with_budget(window:HWND,tag:usize,packet:&[u8],milliseconds:u32)->bool{
 #[cfg(test)]fn send(window:HWND,tag:usize,packet:&[u8])->bool{send_with_budget(window,tag,packet,500)}
 #[cfg(test)]
 fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
-    let packet=if snapshot.this_pc{serde_json::to_vec(&(Some(zsdesk_core::model::explorer::ShellLocation::ThisPc),None::<String>))?}
-        else{crate::reveal::encode(&snapshot.folder,&snapshot.selected).context("文件位置请求超出支持范围")?};
+    let packet=packet(snapshot)?;
     if find_target(profile).is_none(){
         use std::os::windows::process::CommandExt;
         let mut command=std::process::Command::new(executable);
@@ -169,9 +180,10 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
     }
     let deadline=Instant::now()+Duration::from_secs(8);
     let target=loop{if let Some(target)=find_target(profile){break target;}ensure!(Instant::now()<deadline,"文件管理窗口未就绪");thread::sleep(Duration::from_millis(50));};
-    ensure!(send(target,if snapshot.this_pc{crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&packet),"目标窗口未接受文件位置请求");
+    ensure!(send(target,snapshot.open_tag(),&packet),"目标窗口未接受文件位置请求");
     let deadline=Instant::now()+Duration::from_secs(4);
-    while !send(target,if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}else{crate::reveal::VERIFY_TAG},if snapshot.this_pc{&[]}else{&packet}){ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(75));}
+    let (tag,body)=snapshot.verification(&packet);
+    while !send(target,tag,body){ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(75));}
     // A fresh snapshot prevents closing a window the user has already navigated
     // elsewhere, turned into multiple tabs, or placed behind a modal dialog.
     let shell:IShellWindows=unsafe{CoCreateInstance(&ShellWindows,None,CLSCTX_LOCAL_SERVER)}?;
@@ -183,7 +195,8 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
 }
 
 const SELECTION_SETTLE_MS:u64=150;
-const EMPTY_OBSERVATION_MS:u64=600;
+// A caller can populate the Explorer selection well after the directory appears.
+const EMPTY_OBSERVATION_MS:u64=1800;
 const SELECTED_OBSERVATION_MS:u64=450;
 const SELECTION_STABLE_MS:u64=150;
 const CLOSE_RESERVE_MS:u64=120;
@@ -192,7 +205,7 @@ impl Candidate{
     fn new(lease:Lease)->Self{Self{lease,hidden:false,activation_launched:false,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
 }
 fn packet(snapshot:&Snapshot)->Result<Vec<u8>>{
-    if snapshot.this_pc{Ok(serde_json::to_vec(&(Some(zsdesk_core::model::explorer::ShellLocation::ThisPc),None::<String>))?)}
+    if let Some(location) = snapshot.namespace(){Ok(serde_json::to_vec(&(Some(location),None::<String>))?)}
     else{crate::reveal::encode(&snapshot.folder,&snapshot.selected).context("文件位置请求超出支持范围")}
 }
 fn start_target(profile:&Path,snapshot:&Snapshot)->Result<()>{
@@ -262,7 +275,7 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
     ensure!(remaining>0&&guard.active(&candidate.lease),"来源窗口已恢复");
     let budget=remaining.min(25).max(1)as u32;
     if candidate.sent.as_ref().is_none_or(|sent|!sent.equivalent(snapshot)){
-        if !send_with_budget(target,if snapshot.this_pc{crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&bytes,budget){return Ok(());}
+        if !send_with_budget(target,snapshot.open_tag(),&bytes,budget){return Ok(());}
         candidate.sent=Some(snapshot.clone());
         if candidate.lease.foreground||unsafe{GetForegroundWindow()}==snapshot.window{
             // Foreground permission is best effort, never a reason to discard
@@ -276,8 +289,8 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
     // lease and restores Explorer; it never earns a lease extension.
     let stable=candidate.observed.as_ref().map_or(stamp,|(_,at)|*at);
     if close_due(candidate.lease.deadline,visibility_guard::now(),ready,stable,!snapshot.selected.is_empty()){
-        let verified=send_with_budget(target,if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}else{crate::reveal::VERIFY_TAG},
-            if snapshot.this_pc{&[]}else{&bytes},budget);
+        let (tag,body)=snapshot.verification(&bytes);
+        let verified=send_with_budget(target,tag,body,budget);
         if verified&&guard.active(&candidate.lease){
             let latest=read_snapshot(&snapshot.browser,snapshot.window,snapshot.pid)?;
             if !snapshot.equivalent(&latest){candidate.observed=Some((latest,visibility_guard::now()));return Ok(());}
@@ -335,7 +348,6 @@ impl Bridge{
                                     let mut cancel=Vec::new();
                                     for(id,candidate)in &mut candidates{
                                         if candidate.hidden&&!guard.active(&candidate.lease){continue;}
-                                        if batch.recycle_bins.contains(&candidate.lease.identity.window){cancel.push((*id,"Recycle Bin".to_owned()));continue;}
                                         if batch.multiple.contains(&candidate.lease.identity.window){cancel.push((*id,"多标签系统窗口保持独立".to_owned()));continue;}
                                         if let Some(snapshot)=batch.views.iter().find(|view|view.window.0 as isize==candidate.lease.identity.window){
                                             if let Err(error)=update_candidate(&profile,guard,candidate,snapshot){cancel.push((*id,format!("{error:#}")));}
@@ -381,7 +393,7 @@ fn write_status(profile:&Path,active:bool,forwarded:u64,error:Option<&str>,guard
         assert!(!can_deliver(100,249,false));assert!(can_deliver(100,250,false));
         assert!(can_deliver(100,100,true));
         assert!(!close_due(900,549,100,100,true));assert!(close_due(900,550,100,100,true));
-        assert!(!close_due(900,699,100,100,false));assert!(close_due(900,700,100,100,false));
+        assert!(!close_due(2400,1899,100,100,false));assert!(close_due(2400,1900,100,100,false));
         assert!(close_due(900,730,100,500,true),"a slow enumeration must not miss a 40 ms closing window");
         assert!(!close_due(900,700,100,600,true),"late selection has not settled");
         assert!(close_due(900,750,100,600,true));

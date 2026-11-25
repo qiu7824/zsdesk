@@ -64,7 +64,7 @@ impl WindowState{
         let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) };
     }
 
-    pub(super) fn launch_search_settings(&mut self,service:bool){
+    pub(super) fn launch_search_settings(&mut self){
         self.sync_search_preferences();
         if self.session.ui.search_backend.is_builtin(){self.show_message(zsdesk_core::i18n::text("当前使用自带搜索，可在搜索设置中调整索引选项").into());return;}
         self.poll_search_settings();
@@ -74,7 +74,7 @@ impl WindowState{
             let result=(||{
                 unsafe{OleInitialize(None)}?;
                 struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
-                if service{crate::fast_search::everything::enable_service(&profile)}else{crate::fast_search::everything::open_settings(&profile)}
+                crate::fast_search::everything::open_settings(&profile)
             })();let _=sender.send(result);
         }){
             Ok(thread)=>self.search_settings_job=Some(SettingsJob{result:receiver,thread:Some(thread)}),
