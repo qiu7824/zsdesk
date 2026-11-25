@@ -37,7 +37,7 @@ def build(payload, work, compiler):
         raise ValueError("Select an external-only search payload")
     if set(members)!={p.relative_to(payload).as_posix() for p in payload.rglob("*") if p.is_file()}:
         raise ValueError("Payload inventory differs from the release manifest")
-    product=guid("full/"+version)
+    product=guid("full/offline/"+version)
     msi=work/"ZSDesk.msi"
     db=msilib.init_database(str(msi),schema,"ZSDesk "+version+" Full",product,version,"ZSDesk contributors")
     codepage=work/"codepage.idt"
@@ -71,7 +71,7 @@ def build(payload, work, compiler):
         msilib.add_data(db,table,records)
     rows("Property",("UpgradeCode",guid("full/upgrade")),("ARPNOMODIFY","1"),("ARPNOREPAIR","1"),
          ("SecureCustomProperties","OLDPRODUCTS;NEWERPRODUCT;INSTALLDIR;DESKTOPICON;MENUSHORTCUTS"))
-    rows("Upgrade",(guid("full/upgrade"),None,version,None,0,None,"OLDPRODUCTS"),
+    rows("Upgrade",(guid("full/upgrade"),None,version,None,512,None,"OLDPRODUCTS"),
          (guid("full/upgrade"),version,None,None,2,None,"NEWERPRODUCT"))
     rows("LaunchCondition",("NOT NEWERPRODUCT","A newer version of ZSDesk is installed."))
     rows("InstallExecuteSequence",("RemoveExistingProducts","OLDPRODUCTS",1501))
