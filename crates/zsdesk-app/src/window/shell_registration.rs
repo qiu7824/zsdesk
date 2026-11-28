@@ -78,7 +78,6 @@ impl WindowState {
             // Switching focus between two visible panes is not navigation.
             // Preserve the registration identity across a multi-item callback.
             if !self.shell_entries().iter().any(|entry|request.matches(entry)){continue;}
-            self.deferred_selection = None;
             let Some(browser)=&self.browser else{continue;};
             let Ok(view)=(unsafe{browser.current_view()})else{continue;};
             if request.child_pidl.as_deref().is_some_and(|bytes|!valid_relative_pidl(bytes)){continue;}
@@ -87,7 +86,7 @@ impl WindowState {
             let pidl:*const windows::Win32::UI::Shell::Common::ITEMIDLIST=request.child_pidl.as_ref().map_or(std::ptr::null(),|bytes|bytes.as_ptr().cast());
             // A file reveal can arrive before the view has finished populating its rows.
             // For a replacement selection reuse the same bounded confirmation as --select.
-            let name = if request.flags & 5 == 5 && !pidl.is_null() {
+            let name = if request.flags & 1 != 0 && !pidl.is_null() {
                 use windows::{core::Interface,Win32::UI::Shell::{IFolderView2,IShellFolder,IShellItem,SHCreateItemWithParent,SIGDN_FILESYSPATH}};
                 (|| {
                     let parent:IShellFolder = unsafe { view.cast::<IFolderView2>().ok()?.GetFolder() }.ok()?;
@@ -100,12 +99,28 @@ impl WindowState {
                     crate::explorer_forwarder::same_path(path.parent()?,folder).then(||path.file_name().map(|n|n.to_owned())).flatten()
                 })()
             } else {None};
+            let mut pending_names=if name.is_some() && request.flags & 4==0 {
+                self.pending_reveal_names().or_else(||{
+                    let selected=browser.selection_paths_limit(129);
+                    if selected.len()>128{return None;}
+                    let folder=request.location.as_path()?;
+                    selected.into_iter().map(|path|{
+                        let path=PathBuf::from(path);
+                        if !crate::explorer_forwarder::same_path(path.parent()?,folder){return None;}
+                        path.file_name().map(|name|name.to_owned())
+                    }).collect::<Option<Vec<_>>>()
+                })
+            }else{Some(Vec::new())};
+            self.deferred_selection=None;
             // Keep the Shell's per-item selection semantics. In particular,
             // only its first callback may ask to deselect previous items.
             if let Err(error)=unsafe{view.SelectItem(pidl,request.flags&(1|4|8|16))}{
                 diagnostics::record("shell-registration","selection-failed",Some(error.code().0));
             }
-            if let Some(name)=name { self.defer_selection(vec![name],false); }
+            if let (Some(names),Some(name))=(&mut pending_names,name) {
+                if !names.contains(&name){names.push(name);}
+                if names.len()<=128 {self.defer_selection(std::mem::take(names),false);}
+            }
         }
     }
 }

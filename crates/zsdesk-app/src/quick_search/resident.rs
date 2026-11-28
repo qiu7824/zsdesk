@@ -7,7 +7,7 @@ use windows::{core::w,Win32::{Foundation::{HWND,LPARAM,LRESULT,WPARAM,HINSTANCE}
 const EVENT:u32=WM_APP+75;
 const HOTKEY:i32=0x5a53;
 const LIFETIME_TIMER:usize=1;
-struct State{profile:PathBuf,registered:bool,registration_id:i32,hotkey:String,error:Option<String>,persistent:bool,start_with_windows:bool,visible:bool,lifetime_check:std::time::Instant}
+struct State{profile:PathBuf,registered:bool,registration_id:i32,hotkey:String,error:Option<String>,persistent:bool,start_with_windows:bool,permanent_forwarding:bool,visible:bool,lifetime_check:std::time::Instant}
 
 fn chord(text:&str)->Result<(HOT_KEY_MODIFIERS,u32)>{control::native_hotkey(text)}
 fn focus_main(profile:&Path,settings:bool)->Result<()>{
@@ -23,6 +23,7 @@ fn focus_main(profile:&Path,settings:bool)->Result<()>{
 fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
     let prefs=control::load(&state.profile)?.preferences;
     state.start_with_windows=prefs.enabled&&prefs.start_with_windows;
+    state.permanent_forwarding=crate::explorer_forwarder::permanent_enabled(&state.profile);
     let requested=if prefs.enabled{Some(chord(&prefs.hotkey)?)}else{None};
     state.error=None;
     if state.registered&&prefs.enabled&&state.hotkey.eq_ignore_ascii_case(&prefs.hotkey){
@@ -60,6 +61,9 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
     control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,state.registered);
     Ok(prefs.enabled||super::needs_background(&state.profile))
 }
+fn window_scoped(visible:bool,login:bool,permanent_forwarding:bool)->bool{
+    !visible && !login && !permanent_forwarding
+}
 unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     if message==WM_NCCREATE{
         let create=unsafe{&*(lp.0 as*const CREATESTRUCTW)};unsafe{SetWindowLongPtrW(hwnd,GWLP_USERDATA,create.lpCreateParams as isize)};return LRESULT(1);
@@ -95,10 +99,13 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
     }
     if message==WM_TIMER&&wp.0==LIFETIME_TIMER{
         let state=unsafe{&mut*pointer};let visible=super::popup::is_open();
-        if !visible&&!state.start_with_windows&&crate::runtime::stop_unowned_background(){let _=unsafe{DestroyWindow(hwnd)};return LRESULT(0);}
         if state.lifetime_check.elapsed()>=std::time::Duration::from_secs(1){
             state.lifetime_check=std::time::Instant::now();
+            state.permanent_forwarding=crate::explorer_forwarder::permanent_enabled(&state.profile);
             state.persistent=control::load(&state.profile).is_ok_and(|configuration|configuration.preferences.enabled)||super::needs_background(&state.profile);
+        }
+        if window_scoped(visible,state.start_with_windows,state.permanent_forwarding) && crate::runtime::stop_unowned_background(){
+            let _=unsafe{DestroyWindow(hwnd)};return LRESULT(0);
         }
         if state.visible!=visible{state.visible=visible;control::write_status(&state.profile,state.error.as_deref(),visible,&state.hotkey,state.registered);}
         if !unsafe{&*pointer}.persistent&&!super::popup::is_open(){let _=unsafe{DestroyWindow(hwnd)};}
@@ -122,7 +129,7 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
     if action!=Action::Open&&!configuration.preferences.enabled&&!super::needs_background(&profile){return Ok(());}
     let module=HINSTANCE(unsafe{GetModuleHandleW(None)}?.0);let class=w!("ZSDesk.SearchHotkey");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(proc),lpszClassName:class,..Default::default()});}
-    let mut state=Box::new(State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()});
+    let mut state=Box::new(State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,permanent_forwarding:false,visible:false,lifetime_check:std::time::Instant::now()});
     let hwnd=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(module),Some((&mut*state as*mut State).cast()))}?;
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{DestroyWindow(self.0)};}}}let _window=Window(hwnd);
     state.persistent=configure(hwnd,&mut state)?;let listener=instance.listen_native(hwnd,EVENT)?;
@@ -133,6 +140,12 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn permanent_folder_forwarding_survives_window_close_without_login_startup(){
+        assert!(!window_scoped(false,false,true));
+        assert!(window_scoped(false,false,false));
+        assert!(!window_scoped(true,false,false));
+        assert!(!window_scoped(false,true,false));
+    }
     #[test]fn hotkey_translation_keeps_modifiers_and_reserved_keys(){
         let (mods,key)=chord("Ctrl+Alt+Space").unwrap();assert!(mods.contains(MOD_CONTROL)&&mods.contains(MOD_ALT));assert_eq!(key,VK_SPACE.0 as u32);
         assert!(chord("Ctrl+F12").is_err());assert_eq!(chord("Alt+F10").unwrap().1,VK_F10.0 as u32);
@@ -165,7 +178,7 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
             let owner=make()?;let blocker=make()?;let probe=make()?;
             let profile=output.join("explorer-session.json");let config=profile.with_file_name("quick-search.json");
             let write=|enabled:bool,hotkey:&str|->Result<()>{fs::write(&config,serde_json::to_vec(&control::Configuration{preferences:zsdesk_core::model::explorer::QuickSearchPreferences{enabled,hotkey:hotkey.into(),start_with_windows:false},startup_command:None})?)?;Ok(())};
-            let mut state=State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()};
+            let mut state=State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,permanent_forwarding:false,visible:false,lifetime_check:std::time::Instant::now()};
             write(true,"Ctrl+Alt+Shift+F23")?;let initial=configure(owner.0,&mut state)?;
             let (old_mods,old_key)=chord("Ctrl+Alt+Shift+F23")?;
             let initial_status=serde_json::json!({"stage":"initial-registration","hwnd":owner.0.0 as usize,"modifiers":old_mods.0,"vk":old_key,

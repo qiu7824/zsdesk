@@ -10,7 +10,7 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 
 ## 版本
 
-当前版本为 0.4.4。全新安装可选择全量版离线安装包（文件名以 -full-x64-offline-setup.exe 结尾）；此包提供 ZSDesk 自带搜索、网络与桌面组件，使用 Windows Installer 安装。已有 Inno 安装请选择文件名以 -full-x64-setup.exe 结尾的安装包原位升级。
+当前版本为 0.4.5。全新安装可选择全量版离线安装包（文件名以 -full-x64-offline-setup.exe 结尾）；此包提供 ZSDesk 自带搜索、网络与桌面组件，使用 Windows Installer 安装。已有 Inno 安装请选择文件名以 -full-x64-setup.exe 结尾的安装包原位升级。
 x64 安装程序要求 Windows 10 1809（17763）或更高版本。
 
 界面支持简体中文和 English；非中文 Windows 系统默认使用英文。“≡ → 语言 / Language”可选择跟随系统或指定语言，选择后立即切换。文件名称与系统 Shell 文本保持原值。

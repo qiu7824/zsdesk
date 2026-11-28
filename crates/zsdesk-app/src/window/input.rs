@@ -184,6 +184,11 @@ impl WindowState {
                         let labels = [zsdesk_core::i18n::text("全部文件和文件夹"), zsdesk_core::i18n::text("只显示文件夹"), zsdesk_core::i18n::text("只显示文档"), zsdesk_core::i18n::text("只显示图片"), zsdesk_core::i18n::text("只显示视频"), zsdesk_core::i18n::text("只显示音频")];
                         (labels.get(index as usize).copied().unwrap_or("").into(), panel.categories.get(index as usize).copied().unwrap_or_default())
                     }
+                    SearchPanelHit::Apps => (zsdesk_core::i18n::text("匹配的应用").into(),panel.apps),
+                    SearchPanelHit::ToggleScope => {
+                        let label=if self.search_controls().scope.is_some(){"当前文件夹 · 切换到全部磁盘"}else{"全部磁盘 · 切换到文件夹"};
+                        (zsdesk_core::i18n::text(label).into(),panel.scope_toggle)
+                    }
                     SearchPanelHit::Scope => {
                         let scope = self.search_controls().scope.map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|| zsdesk_core::i18n::text("全部磁盘").into());
                         (zsdesk_core::tr_format!("搜索范围：{scope}；点击更改", scope=scope), panel.scope)
@@ -256,8 +261,7 @@ impl WindowState {
         }
         if let Some(mut drag) = self.tab_drag {
             let threshold = unsafe { GetSystemMetricsForDpi(if self.layout.vertical_tabs { SM_CYDRAG } else { SM_CXDRAG }, self.dpi) };
-            let axis=if self.layout.vertical_tabs{p.y}else{p.x};
-            if !drag.moved && (axis - drag.start_axis).abs() > threshold { drag.moved = true; }
+            if !drag.moved && (p.x-drag.start.x).abs().max((p.y-drag.start.y).abs()) > threshold { drag.moved = true; }
             if drag.moved {
                 let target = self.layout.tab_drag_target(p.x, p.y);
                 if let Some(target) = target.filter(|&t| t != drag.index && t < self.session.tabs.len()) {
@@ -299,7 +303,7 @@ impl WindowState {
             },
             Hit::Tab(i) => {
                 unsafe { self.select_tab(i); }
-                self.tab_drag = Some(TabDrag { index: self.session.active_tab, start_axis: if self.layout.vertical_tabs{p.y}else{p.x}, moved: false });
+                self.tab_drag = Some(TabDrag { index: self.session.active_tab, start: p, moved: false });
                 unsafe { SetCapture(self.hwnd); }
             }
             Hit::BookmarkSplitter=>{self.bookmark_resize=Some((p.x,self.layout.bookmarks_row.width));unsafe{SetCapture(self.hwnd);}},
@@ -327,6 +331,7 @@ impl WindowState {
         if self.splitter_drag.take().is_some() { if had_capture { let _ = unsafe { ReleaseCapture() }; } self.save(); self.invalidate(); return; }
         if let Some(drag) = self.tab_drag.take() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            if drag.moved && self.merge_dragged_tab(drag.index,p){return;}
             if drag.moved && self.tab_dragged_out(p) { unsafe { self.tear_off_tab(drag.index); } return; }
             if drag.moved { self.save(); }
             return;
@@ -574,15 +579,25 @@ impl WindowState {
         let anchor = self.layout.command_rect(CommandId::View);
         let mut menu = menus::view_menu(mode, icon, show);
         if mode == 4 && !self.columns.active {
-            if let Some((modified,created)) = self.browser.as_ref().and_then(|b| b.date_columns()) {
-                menu.items.push(menus::submenu(zsdesk_core::i18n::text("详细信息列"), vec![
-                    menus::entry(zsdesk_core::i18n::text("修改时间"),"column-modified",true,modified),
-                    menus::entry(zsdesk_core::i18n::text("创建时间"),"column-created",true,created),
-                ]));
+            let mut columns=Vec::new();
+            if let Some((modified,created))=self.browser.as_ref().and_then(|browser|browser.date_columns()){
+                columns.push(menus::entry(zsdesk_core::i18n::text("修改时间"),"column-modified",true,modified));
+                columns.push(menus::entry(zsdesk_core::i18n::text("创建时间"),"column-created",true,created));
             }
+            columns.push(menus::item(zsdesk_core::i18n::text("选择详细信息…"),"column-choose"));
+            menu.items.push(menus::submenu(zsdesk_core::i18n::text("详细信息列"),columns));
         }
         let choice = popup(self.hwnd, &menu, anchor);
         match choice.as_deref() {
+            Some("column-choose")=>{
+                if let Some(browser)=&self.browser {
+                    match super::detail_columns::choose(self.hwnd,browser,self.dark){
+                        Ok(true)=>{unsafe{self.capture_active();}self.save();}
+                        Ok(false)=>{}
+                        Err(error)=>self.show_message(error.to_string()),
+                    }
+                }
+            }
             Some(id @ ("column-modified" | "column-created")) => {
                 if let Some(browser) = &self.browser {
                     match browser.toggle_date_column(id=="column-created") {
@@ -1016,13 +1031,13 @@ impl WindowState {
         if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-clear")&&!self.persist_search_preferences(){return;}
+        if id=="search-applications" && self.session.ui.search_applications {crate::application_search::warm();}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
         if id=="interface-navigation" || id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
         self.crumbs_for=None;
-        if id=="search-all-files" || id=="search-current-folder"{
-            let scope=if self.session.ui.search_all_files{None}else{
-                self.search_scope.as_ref().unwrap_or_else(||self.current_location()).as_path().map(PathBuf::from)
-            };
+        if matches!(id,"search-all-files"|"search-current-folder"|"search-switch-scope"){
+            let origin=self.search_scope.as_ref().unwrap_or_else(||self.current_location());
+            let scope=super::integrated_search::default_scope(&self.session.ui,origin);
             self.search_controls_mut().scope=scope;
             unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
         }

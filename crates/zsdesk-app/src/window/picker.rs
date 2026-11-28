@@ -28,7 +28,7 @@ impl SelectionKind{
     pub fn title(self)->&'static str{if self.folders(){zsdesk_core::i18n::text("选择文件夹")}else{zsdesk_core::i18n::text("选择文件")}}
 }
 #[derive(Clone)]pub(crate) struct Options{
-    pub token:u64,pub title:String,pub initial:ShellLocation,pub multiple:bool,pub kind:SelectionKind,
+    pub owner:Option<(isize,u32)>,pub token:u64,pub title:String,pub initial:ShellLocation,pub multiple:bool,pub kind:SelectionKind,
     pub initial_name:String,pub types:Vec<FileType>,pub filter:usize,pub events:Sender<Event>,
 }
 #[derive(Clone,Debug,Default)]pub(crate) enum Outcome{

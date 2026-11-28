@@ -340,6 +340,15 @@ impl WindowState {
             let search = rf(l.search);
             let search_focused = unsafe { GetFocus() } == self.search_edit;
             self.text_box(cv, search, search_focused, self.hover == Hit::Search && !search_focused);
+            if !l.search_panel.apps.is_empty(){
+                let count=self.search_controls().app_matches;
+                let label=if count==0{zsdesk_core::i18n::text("应用").into()}else{format!("{} ({count})",zsdesk_core::i18n::text("应用"))};
+                cv.text(&label,rf(l.search_panel.apps),&TextStyle::ui(self.sf(11.)).align(Align::Center),c(p.text_secondary));
+            }
+            if !l.search_panel.scope_toggle.is_empty(){
+                let local=self.search_controls().scope.is_some();
+                cv.glyph(if local{glyph::FOLDER}else{"\u{e7f1}"},rf(l.search_panel.scope_toggle),self.sf(14.0),c(p.text_secondary));
+            }
             let glyph_rect = RectF::new(search.right() - self.sf(34.0), search.y, self.sf(30.0), search.h);
             cv.glyph(if self.search_panel.open { glyph::CLOSE_SMALL } else { glyph::SEARCH }, glyph_rect, self.sf(13.0), c(p.text_secondary));
         }

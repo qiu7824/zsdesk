@@ -392,6 +392,8 @@ pub struct ExplorerUi {
     pub command_bar: CommandBarPreferences,
     pub context_menu: ContextMenuPreferences,
     pub search_all_files: bool,
+    pub search_switch_scope: bool,
+    pub search_applications: bool,
     pub search_backend: SearchBackendPreference,
     pub search_include_development: bool,
     pub search_index_metadata: bool,
@@ -420,6 +422,7 @@ pub struct ExplorerUi {
 
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub struct SearchPreferences {
+    pub applications:bool,pub all_files:bool,pub switch_scope:bool,
     pub backend:SearchBackendPreference,pub include_development:bool,pub index_metadata:bool,pub pinyin_initials:bool,
     pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
 }
@@ -428,10 +431,10 @@ impl ExplorerUi{
         ((monitor_dpi.max(96) as u64*u64::from(self.interface_text_percent.clamp(100,150))+50)/100).min(u32::MAX as u64) as u32
     }
     pub fn tab_count_button_visible(&self)->bool{self.show_tab_count&&self.show_tab_list}
-    pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,include_development:self.search_include_development,
+    pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{applications:self.search_applications,all_files:self.search_all_files,switch_scope:self.search_switch_scope,backend:self.search_backend,include_development:self.search_include_development,
         index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
         everything_executable:self.everything_executable.clone(),folder_sizes:self.everything_folder_sizes}}
-    pub fn apply_search_preferences(&mut self,prefs:&SearchPreferences){self.search_backend=prefs.backend;self.search_include_development=prefs.include_development;
+    pub fn apply_search_preferences(&mut self,prefs:&SearchPreferences){self.search_applications=prefs.applications;self.search_all_files=prefs.all_files;self.search_switch_scope=prefs.switch_scope;self.search_backend=prefs.backend;self.search_include_development=prefs.include_development;
         self.search_index_metadata=prefs.index_metadata;self.search_pinyin_initials=prefs.pinyin_initials;self.search_idle_seconds=prefs.idle_seconds;
         self.everything_executable=prefs.everything_executable.clone();self.everything_folder_sizes=prefs.folder_sizes;}
 }
@@ -443,7 +446,7 @@ impl Default for ExplorerUi {
             close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,tab_style:TabStyle::default(),
             show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false,bookmark_display:BookmarkDisplay::default(),navigation_divider:NavigationDivider::default(),interface_text_percent:100, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
-            search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
+            search_all_files: true, search_switch_scope: false, search_applications: false, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
             everything_executable:None,
             hover_preview: false, archives_open_externally: false, preview_provider: PreviewProviderPreference::System,
@@ -505,6 +508,12 @@ impl Default for ExplorerSession {
 }
 
 impl ExplorerSession {
+    pub fn retain_locked_tabs(&mut self) {
+        self.tabs.retain(|tab|tab.locked);
+        self.secondary_pane.tabs.retain(|tab|tab.locked);
+        self.secondary_pane.active_tab=self.secondary_pane.active_tab.min(self.secondary_pane.tabs.len().saturating_sub(1));
+        self.active_tab=0;
+    }
     /// Applied only when opening a window without an explicit Shell target.
     pub fn apply_startup_location(&mut self) {
         let location=match &self.ui.startup_location {
@@ -512,8 +521,10 @@ impl ExplorerSession {
             StartupLocation::ThisPc=>ShellLocation::ThisPc,
             StartupLocation::Folder(path)=>ShellLocation::Path(path.clone()),
         };
-        let id=self.take_id();self.tabs=vec![ExplorerTab::new(id,location)];self.active_tab=0;
-        self.secondary_pane=ExplorerPaneSession::default();
+        self.retain_locked_tabs();
+        if let Some(index)=self.tabs.iter().position(|tab|tab.current()==&location){self.active_tab=index;}else{
+            let id=self.take_id();self.tabs.push(ExplorerTab::new(id,location));self.active_tab=self.tabs.len()-1;
+        }
     }
 
     pub fn normalize(&mut self) {
@@ -723,6 +734,38 @@ mod tests {
         let session: ExplorerSession = serde_json::from_str(text).unwrap();
         assert!(session.ui.show_tree && session.ui.show_bookmarks);
         assert_eq!(session.ui.tree_width, 220);
+    }
+
+    #[test]
+    fn explicit_startup_keeps_locked_tabs_in_both_panes() {
+        let mut session=ExplorerSession::default();
+        let target=ShellLocation::Path(r"C:\projects".into());
+        let mut keep=ExplorerTab::new(17,target.clone());keep.locked=true;
+        session.tabs.push(keep.clone());
+        let mut secondary=ExplorerTab::new(23,ShellLocation::ThisPc);secondary.locked=true;
+        session.secondary_pane.tabs.push(secondary);
+        session.next_id=24;
+        session.ui.startup_location=StartupLocation::Folder(r"C:\projects".into());
+        session.apply_startup_location();
+        assert_eq!(session.tabs,vec![keep]);
+        assert_eq!(session.active_tab().current(),&target);
+        assert_eq!(session.secondary_pane.tabs.len(),1);
+        assert_eq!(session.secondary_pane.tabs[0].id,23);
+    }
+
+    #[test]
+    fn old_search_scopes_and_new_search_preferences_round_trip() {
+        for global in [false,true] {
+            let mut ui:ExplorerUi=serde_json::from_value(serde_json::json!({"search_all_files":global})).unwrap();
+            assert_eq!(ui.search_all_files,global);
+            assert!(!ui.search_switch_scope && !ui.search_applications);
+            ui.search_switch_scope=true;ui.search_applications=true;
+            let mut copy=ExplorerUi::default();
+            copy.apply_search_preferences(&ui.search_preferences());
+            assert_eq!(copy.search_preferences(),ui.search_preferences());
+            let saved:ExplorerUi=serde_json::from_value(serde_json::to_value(copy).unwrap()).unwrap();
+            assert!(saved.search_switch_scope&&saved.search_applications);
+        }
     }
 
     #[test]

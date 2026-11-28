@@ -219,6 +219,16 @@ impl NamespaceTreeHost {
             }
         }
 
+        // Bind the installed WSL namespace lazily. Expanding it is the first
+        // operation that should enumerate distributions or start a VM.
+        let linux=ShellLocation::Shell { pidl:None, parsing_name:"shell:::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}".into(), title:"Linux".into() };
+        if let Ok(item)=unsafe {shell_item(&linux)} {
+            use windows::Win32::UI::Shell::{BHID_SFObject,IShellFolder};
+            if unsafe {item.BindToHandler::<_,IShellFolder>(None,&BHID_SFObject)}.is_ok() {
+                let _=unsafe {tree.AppendRoot(&item,enum_flags,NSTCRS_VISIBLE.0 as u32,&filter)};
+            }
+        }
+
         let syncing=Rc::new(Cell::new(0));
         let last_location=Rc::new(RefCell::new(None));
         let pending_sync=Rc::new(PendingTreeSync{tree:tree.clone(),hwnd,native_tree:Cell::new(HWND::default()),syncing:syncing.clone(),

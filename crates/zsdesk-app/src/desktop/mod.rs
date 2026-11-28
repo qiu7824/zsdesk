@@ -219,8 +219,12 @@ fn flush_foreground(host: HWND) {
     else { let _=unsafe { KillTimer(Some(host),TIMER_FOREGROUND) }; }
 }
 
-/// Moves a fence in the z-order without the layer guard interfering.
+/// Reveal a pre-positioned fence without touching activation or z-order.
+pub(super) fn show_in_place(hwnd:HWND){
+    let _=unsafe {SetWindowPos(hwnd,None,0,0,0,0,SWP_SHOWWINDOW|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_NOACTIVATE)};
+}
 pub(super) fn set_z(hwnd: HWND, after: HWND) {
+    if unsafe{GetWindow(hwnd,GW_HWNDPREV)}.ok()==Some(after){return;}
     let previous = ALLOW_Z.with(|z| z.replace(true));
     let _ = unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER) };
     ALLOW_Z.with(|z| z.set(previous));

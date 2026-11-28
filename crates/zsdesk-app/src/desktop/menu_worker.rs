@@ -272,11 +272,10 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     };
     timing.request_snapshot_microseconds=micros(stage.elapsed());
     let input_to_client=micros(request.input_started.elapsed());
-    let quick_first=options.quick_first;
     let mut client=crate::context_menu_process::Client::spawn_with_layout(HWND(request.owner as*mut _),request.point,pidls,folder,options,intercept,mode,request.extended,request.layout.clone())
         .map_err(|error|windows::core::Error::new(crate::context_menu_process::failure_code(&error),crate::context_menu_process::failure_message(&error)))?;
     timing.extension_process=client.pid();
-    let worker=quick_first.then_some(timing.extension_process).flatten();
+    let worker=timing.extension_process;
     loop{
         if !shared.current(request.generation){client.finish_dismissal();return Err(error_abort());}
         if let Some(result)=client.poll(&mut|before|validate(shared,request,before).is_ok()&&(before||foreground_allowed(request.foreground)||crate::context_menu_process::foreground_is_menu_worker(worker,HWND(request.owner as *mut _)))){

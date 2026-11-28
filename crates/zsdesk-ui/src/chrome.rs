@@ -100,6 +100,8 @@ pub struct ChromeInput<'a> {
     pub bookmarks_width: i32,
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
+    pub quick_scope: bool,
+    pub search_apps: bool,
     pub command_bar: &'a CommandBarPreferences,
     /// Own status bar; the hosted Shell view normally draws the native one.
     pub status_bar: bool,
@@ -112,7 +114,7 @@ pub struct TabSlot { pub index: usize, pub rect: Rect, pub close: Rect, pub show
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchPanelHit {
-    Category(u8), Scope, Sort, Previous, Next, Clear, Close, Submit, IndexSettings, Retry,
+    Category(u8), Scope, ToggleScope, Apps, Sort, Previous, Next, Clear, Close, Submit, IndexSettings, Retry,
 }
 
 /// Search action geometry shared by native edit placement and hit testing.
@@ -125,6 +127,8 @@ pub struct SearchPanelLayout {
     pub clear: Rect,
     pub close: Rect,
     pub scope: Rect,
+    pub scope_toggle: Rect,
+    pub apps: Rect,
     pub categories: Vec<Rect>,
     pub status: Rect,
     pub sort: Rect,
@@ -183,7 +187,7 @@ impl SearchPanelLayout {
 
     fn translate_x(&mut self, dx: i32) {
         for rect in [&mut self.card, &mut self.title, &mut self.query, &mut self.submit,
-            &mut self.clear, &mut self.close, &mut self.scope, &mut self.status, &mut self.sort,
+            &mut self.clear, &mut self.close, &mut self.scope, &mut self.scope_toggle, &mut self.apps, &mut self.status, &mut self.sort,
             &mut self.previous, &mut self.page, &mut self.next, &mut self.index_settings, &mut self.retry] {
             rect.x += dx;
         }
@@ -441,6 +445,19 @@ impl ChromeLayout {
         if input.search_panel_open {
             layout.search_panel.close = Rect::clamped(layout.search.right()-s(34),field_y,s(30),field_h);
         }
+        if input.quick_scope {
+            let right=layout.search.right()-s(34);
+            layout.search_panel.scope_toggle=Rect::clamped(right-s(26),field_y,s(26),field_h);
+        }
+
+        if input.search_panel_open && input.search_apps {
+            let right=if input.quick_scope{layout.search_panel.scope_toggle.x}else{layout.search_panel.close.x};
+            // Keep at least 90 DIPs available for typing. Narrow windows
+            // expose installed apps through Search Options.
+            if right-layout.search.x>=s(160){
+                layout.search_panel.apps=Rect::clamped(right-s(62),field_y,s(62),field_h);
+            }
+        }
 
         // Status bar and content.
         let status_h = if input.status_bar { s(STATUS_H) } else { 0 };
@@ -569,6 +586,8 @@ impl ChromeLayout {
         }
         if self.bookmark_overflow.contains(x,y){return Hit::BookmarkOverflow;}
         if self.nav_row.contains(x, y) {
+            if self.search_panel.apps.contains(x,y){return Hit::SearchPanel(SearchPanelHit::Apps);}
+            if self.search_panel.scope_toggle.contains(x,y){return Hit::SearchPanel(SearchPanelHit::ToggleScope);}
             if self.search_panel.close.contains(x,y) { return Hit::SearchPanel(SearchPanelHit::Close); }
             for (rect, hit) in [(self.back, Hit::Back), (self.forward, Hit::Forward), (self.up, Hit::Up),
                 (self.refresh, Hit::Refresh), (self.command_toggle,Hit::ToggleCommandBar), (self.address, Hit::Address), (self.search, Hit::Search)] {
@@ -681,7 +700,7 @@ mod tests {
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmark_dropdown:false,bookmarks_width:scale(210,dpi),
-            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false, quick_scope: false, search_apps:false }
     }
 
     #[test]
@@ -792,6 +811,18 @@ mod tests {
                 assert!(layout.search_panel.card.is_empty());
                 assert!(layout.address.right()<layout.search.x);
                 assert_eq!(layout.hit(layout.search.x+1,layout.search.y+1),Hit::Search);
+                let before_close=layout.search_panel.close.x-1;
+                assert_eq!(layout.hit(before_close,layout.search.y+1),Hit::Search);
+                let switch=ChromeLayout::new(&ChromeInput{search_panel_open:true,quick_scope:true,search_apps:true,tab_placement:placement,
+                    height:scale(900,dpi),..input(scale(width,dpi),6,2,dpi)});
+                let scope=switch.search_panel.scope_toggle;
+                assert!(scope.x>switch.search.x && scope.right()==switch.search_panel.close.x);
+                assert_eq!(switch.hit(scope.x+1,scope.y+1),Hit::SearchPanel(SearchPanelHit::ToggleScope));
+                let apps=switch.search_panel.apps;
+                if !apps.is_empty(){
+                    assert!(apps.right()<=scope.x && apps.x-switch.search.x>=scale(90,dpi));
+                    assert_eq!(switch.hit(apps.x+1,apps.y+1),Hit::SearchPanel(SearchPanelHit::Apps));
+                }
                 let close=layout.search_panel.close;
                 assert!(!close.is_empty());
                 assert_eq!(layout.hit(close.x+1,close.y+1),Hit::SearchPanel(SearchPanelHit::Close));

@@ -100,6 +100,21 @@ impl MenuOwner {
         self.thread!=0 && live.thread==self.thread && live.process==self.process
     }
 }
+impl MenuOwner {
+    fn visible_explorer(self)->bool{
+        let window=HWND(self.window as *mut _);
+        if !self.alive() || !unsafe{IsWindowVisible(window)}.as_bool() || unsafe{IsIconic(window)}.as_bool(){return false;}
+        let mut name=[0u16;64];
+        let length=unsafe{GetClassNameW(window,&mut name)}.max(0) as usize;
+        name[..length].iter().copied().eq("ZSDesk.Native.Explorer".encode_utf16())
+    }
+    fn retain_idle(self,private_runtime:bool)->bool{
+        private_runtime || (zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build()) && self.visible_explorer())
+    }
+    fn still_active(self)->bool{
+        if zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build()){self.visible_explorer()}else{self.alive()}
+    }
+}
 struct IdleWorker {
     child:Option<Child>,job:Option<usize>,workspace:PathBuf,session:String,token:String,events:Option<EventSet>,
     count:u32,created:u64,last_used:Instant,desktop:usize,thread:u32,
@@ -112,7 +127,7 @@ struct IdleWorker {
 }
 impl IdleWorker {
     fn within_lifetime(&self,margin:Duration)->bool{
-        match self.native_owner{Some(owner)=>owner.alive(),None=>self.last_used.elapsed()<IDLE_TIMEOUT.saturating_sub(margin)}
+        match self.native_owner{Some(owner)=>owner.still_active(),None=>self.last_used.elapsed()<IDLE_TIMEOUT.saturating_sub(margin)}
     }
 }
 impl Drop for IdleWorker {fn drop(&mut self){
@@ -421,7 +436,11 @@ impl Client{
     }
     fn spawn_at(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,origin:Origin)->Result<Self>{
         // Keep worker selection and its lifetime policy on the effective OS presentation.
-        let options=zsdesk_windows::shell::menu::resolve_presentation(options);
+        let mut options=zsdesk_windows::shell::menu::resolve_presentation(options);
+        if extended && !origin.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10){
+            options.modern=false;
+            options.drawn=false;
+        }
         if !mode.prewarm(){prewarm::interrupt();}
         let started=origin.started;let started_counter=origin.counter;
         let root=diagnostics_directory();ensure!(root.is_absolute(),"菜单缓存目录必须是绝对路径");fs::create_dir_all(&root)?;
@@ -632,8 +651,8 @@ impl Drop for Client{fn drop(&mut self){
     if reusable{
         let idle=IdleWorker{child:self.child.take(),job:self.job.take(),workspace:self.workspace.clone(),session:self.session.clone(),token:self.token.clone(),
             events:self.events.take(),count:self.ordinal,created:self.child_created,last_used:Instant::now(),desktop:self.desktop,thread:self.thread,committed,
-            prepared_drawn:self.mode.prewarm() && self.last_status.as_ref().is_some_and(|s|s.native_menu["drawn_renderer_ready"]==true),
-            native_owner:self.last_status.as_ref().filter(|s|s.native_menu["runtime_initializations"].as_u64().unwrap_or(0)>0).map(|_|self.owner)};
+            prepared_drawn:self.last_status.as_ref().is_some_and(|s|s.native_menu["drawn_renderer_ready"]==true),
+            native_owner:self.owner.retain_idle(self.last_status.as_ref().is_some_and(|s|s.native_menu["runtime_initializations"].as_u64().unwrap_or(0)>0)).then_some(self.owner)};
         let retired={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());let old=pool.iter().position(|worker|worker.thread==self.thread).map(|index|pool.swap_remove(index));
             let evicted=if pool.len()>=MAX_IDLE_WORKERS{Some(pool.remove(0))}else{None};pool.push(idle);(old,evicted)};drop(retired);start_reaper();return;
     }
@@ -919,6 +938,19 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
     if let Some(result)=forward_menu_message(msg,wp,lp){return result;}
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
+fn can_park_menu(prewarm:bool,drawn:bool,windows10:bool,renderer_ready:bool)->bool{
+    prewarm || !drawn || (windows10 && renderer_ready)
+}
+
+#[cfg(test)]
+#[test]
+fn windows10_full_menu_can_reuse_its_loaded_renderer(){
+    assert!(can_park_menu(false,false,true,false));
+    assert!(can_park_menu(false,true,true,true));
+    assert!(!can_park_menu(false,true,true,false));
+    assert!(!can_park_menu(false,true,false,true));
+}
+
 fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_report_available:bool)->Result<bool>{
     let _language=request.english.map(zsdesk_core::i18n::Scope::english);
     let setup=Instant::now();let worker_started=monotonic_us();
@@ -953,12 +985,13 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         zsdesk_windows::shell::menu::set_context_menu_options(requested);
         if request.mode.prewarm(){
             let effective=zsdesk_windows::shell::menu::context_menu_options();
-            if effective.drawn {
-                zsdesk_windows::shell::menu::prepare_drawn_runtime()?;
-                if request.folder.is_some() && effective.native_first_page_apps.as_ref().is_some_and(|apps| !apps.is_empty()) {
-                    if let Some(folder)=request.view_context.as_ref().and_then(|context| context.folder.as_deref()) {
-                        background_view::prepare_folder(folder,&request,events)?;
-                    }
+            if effective.drawn { zsdesk_windows::shell::menu::prepare_drawn_runtime()?; }
+            let legacy=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
+            let warm_background=legacy && request.mode==Mode::PrepareBackground;
+            let warm_extensions=effective.drawn && effective.native_first_page_apps.as_ref().is_some_and(|apps|!apps.is_empty());
+            if request.folder.is_some() && (warm_background || warm_extensions) {
+                if let Some(folder)=request.view_context.as_ref().and_then(|context|context.folder.as_deref()) {
+                    background_view::prepare_folder(folder,&request,events)?;
                 }
             }
             return Ok(MenuOutcome::Dismissed);
@@ -976,7 +1009,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             if unsafe{GetForegroundWindow()}!=window{return Ok(MenuOutcome::Dismissed);}
             watch.tracking_started.set(monotonic_us());
             let anchor=crate::flyout_menu::MenuAnchor::Point{x:request.point[0],y:request.point[1]};
-            let choice=crate::flyout_menu::show(window,&first,anchor,zsdesk_windows::theme::menus_dark());
+            let choice=if request.options.drawn || request.options.modern {
+                crate::flyout_menu::show(window,&first,anchor,zsdesk_windows::theme::menus_dark())
+            }else{crate::flyout_menu::native(window,&first,anchor)};
             match choice.as_deref(){
                 Some("more")=>{},
                 Some("properties")=>properties=true,
@@ -1005,9 +1040,13 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         }else{None};
         let effective_options=zsdesk_windows::shell::menu::context_menu_options();
         let legacy_shell=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
-        let classic_selection=legacy_shell
+        // A live ResultsFolder owns the visual selection. Recreating it in a
+        // hidden browser can wait indefinitely for non-folder rows. Bind the
+        // full menu directly to the captured absolute items instead.
+        let result_selection=request.view_context.as_ref().is_some_and(|source|source.results) && !is_background;
+        let classic_selection=(legacy_shell || result_selection)
             &&!request.pidls.is_empty()&&!is_background;
-        let compact_selection=if legacy_shell {None}else{background_view::compact_selection(window,&request,&effective_options)?};
+        let compact_selection=if legacy_shell || result_selection {None}else{background_view::compact_selection(window,&request,&effective_options)?};
         let background_view=if compact_selection.is_some(){None}
             else if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
             else if !request.pidls.is_empty()&&!classic_selection{
@@ -1026,7 +1065,14 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }
             else if packaged&&!legacy_shell{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
             else{ShellMenu::for_view(&host.view,!is_background)?}
-        }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
+        }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}
+        else if result_selection {
+            // ResultsFolder may wrap a filesystem item in a relative PIDL that
+            // belongs to the live view. Bind extensions to the actual files.
+            let physical=zsdesk_windows::shell::file_transfer::paths_from_pidls(&request.pidls).ok()
+                .and_then(|paths|paths.into_iter().map(|path|zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path))).collect::<Option<Vec<_>>>());
+            ShellMenu::for_items(window,physical.as_deref().unwrap_or(&request.pidls))?
+        }else{ShellMenu::for_items(window,&request.pidls)?};
         menu.set_directory(request.folder.as_deref());
         if let Some(context)=&request.view_context{menu.set_input_context(context.keyboard,context.f10);}
         // Creation selection feedback is optional for generic background
@@ -1170,9 +1216,11 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         // them become visible before deciding whether this process is idle.
         pump(150);
     }
-    // A drawn request owns one short-lived isolation process. The existing
-    // done path still pumps modeless dialogs and protects clipboard ownership.
-    let reusable=(state.request.mode.prewarm() || !state.request.options.drawn)&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
+    // The Windows 10 renderer uses a public HMENU. Once dismissed, its
+    // STA and loaded Shell providers can serve another fresh selection.
+    let legacy=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
+    let reusable=can_park_menu(state.request.mode.prewarm(),state.request.options.drawn,legacy,
+        zsdesk_windows::shell::menu::drawn_renderer_ready())&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
         &&persisted&&!owns_clipboard()&&!process_visible_windows(std::process::id(),window)&&!EventSet::signaled(events.cancel);
     if reusable{
         // Release all selection/menu objects and their real owner before
@@ -1250,10 +1298,10 @@ fn run_worker(path:&Path)->Result<()>{
         let ordinal=request.ordinal;let token=request.token.clone();
         let owner=MenuOwner::capture(HWND(request.owner as *mut _));
         if !run_request(path,request, &events,com_us,fault_report_available)?{return Ok(());}com_us=0;
-        let native=zsdesk_windows::shell::menu_diagnostics().runtime_initializations>0;
+        let bound=owner.retain_idle(zsdesk_windows::shell::menu_diagnostics().runtime_initializations>0);
         let deadline=Instant::now()+IDLE_TIMEOUT;
         loop{
-            let expired=if native{!owner.alive()}else{Instant::now()>=deadline};
+            let expired=if bound{!owner.still_active()}else{Instant::now()>=deadline};
             if EventSet::signaled(events.cancel)||expired||created(parent.0)!=Some(parent.1){linger();return Ok(());}
             match wait_signal(&[events.request,events.cancel],1000){
                 Some(0)=>break,Some(1)=>{linger();return Ok(());},_=>pump(0),

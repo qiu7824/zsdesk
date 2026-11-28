@@ -18,6 +18,7 @@ mod context_preferences;
 mod flyout_menu;
 mod routing_control;
 mod fast_search;
+mod application_search;
 mod folder_size_data;
 mod quick_search;
 mod win_e_bridge;

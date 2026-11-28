@@ -12,7 +12,7 @@ const SUBCLASS:usize=0x5a534247;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) struct Colors{pub background:u32,pub high_contrast:bool,pub dark:bool}
 #[derive(Clone,Copy,PartialEq,Eq)]
-enum PaintOwner{Container,Native,ListView}
+enum PaintOwner{Container,Native,ListView,Header}
 #[derive(Clone)]
 pub(super) struct ThemePermit{pending:Rc<Cell<bool>>,generation:Rc<Cell<u64>>,expected:u64}
 impl ThemePermit{
@@ -28,6 +28,7 @@ fn paint_owner(hwnd:HWND)->Option<PaintOwner>{
         "SHELLDLL_DefView"|"ExplorerBrowserControl"=>Some(PaintOwner::Container),
         "DirectUIHWND"=>Some(PaintOwner::Native),
         "SysListView32"=>Some(PaintOwner::ListView),
+        "SysHeader32"=>Some(PaintOwner::Header),
         _=>None,
     }
 }
@@ -58,7 +59,7 @@ fn install_one_phase(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner,apply_th
     // DefView/DirectUI own their ItemsView theme, inherited from the browser
     // container before navigation. Do not replace it after the view is ready.
     if changed{
-        if owner==PaintOwner::ListView{crate::theme::theme_control(hwnd,palette.dark);}
+        if matches!(owner,PaintOwner::ListView|PaintOwner::Header){crate::theme::theme_control(hwnd,palette.dark);}
         else{
             crate::theme::allow_dark_for_window(hwnd,palette.dark);
             if permitted(apply_theme,permit.as_ref()){

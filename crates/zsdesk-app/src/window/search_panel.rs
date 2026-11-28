@@ -59,6 +59,7 @@ pub(super) struct SearchControls {
     pub offset: u32,
     pub total: u64,
     pub shown: usize,
+    pub app_matches: usize,
     pub busy: bool,
     pub error: Option<String>,
 }
@@ -66,7 +67,7 @@ pub(super) struct SearchControls {
 impl Default for SearchControls {
     fn default() -> Self {
         Self { category: SearchCategory::All, scope: None, origin: None, draft: None, sort: SearchSort::NameAsc,
-            offset: 0, total: 0, shown: 0, busy: false, error: None }
+            offset: 0, total: 0, shown: 0, app_matches:0, busy: false, error: None }
     }
 }
 
@@ -94,8 +95,11 @@ impl WindowState {
         let controls=self.search_controls();
         let categories=SearchCategory::ALL.iter().enumerate().map(|(index,category)|
             menus::entry(category.label(),&format!("search-filter-{index}"),true,*category==controls.category)).collect();
-        menus::submenu(zsdesk_core::i18n::text("搜索选项"),vec![
-            menus::submenu(zsdesk_core::i18n::text("文件类型"),categories),
+        let mut items=vec![menus::submenu(zsdesk_core::i18n::text("文件类型"),categories)];
+        if self.session.ui.search_applications && controls.scope.is_none() && self.layout.search_panel.apps.is_empty(){
+            items.push(menus::item(zsdesk_core::i18n::text("匹配的应用"),"search-matching-apps"));
+        }
+        items.extend([
             menus::item(zsdesk_core::i18n::text("搜索范围…"),"search-scope"),
             menus::item(zsdesk_core::i18n::text("结果排序…"),"search-order"),
             menus::entry(zsdesk_core::i18n::text("上一页结果"),"search-page-previous",!controls.busy&&controls.offset>0,false),
@@ -105,14 +109,15 @@ impl WindowState {
             menus::MenuItemSpec::Separator,
             if self.session.ui.search_backend.is_builtin(){menus::item(zsdesk_core::i18n::text("重建自带索引"),"search-native-rebuild")}else{menus::item(zsdesk_core::i18n::text("Everything 索引设置…"),"search-settings")},
             menus::item(zsdesk_core::i18n::text("搜索引擎状态…"),"search-engine-status"),
-        ])
+        ]);
+        menus::submenu(zsdesk_core::i18n::text("搜索选项"),items)
     }
 
     pub(super) unsafe fn apply_search_option(&mut self,id:&str)->bool {
         if id=="search-engine-status"{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}return true;}
         if id=="search-native-rebuild"{self.rebuild_search_index();return true;}
         let hit=match id {
-            "search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,
+            "search-matching-apps"=>SearchPanelHit::Apps,"search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,
             "search-page-previous"=>SearchPanelHit::Previous,"search-page-next"=>SearchPanelHit::Next,
             "search-close"=>SearchPanelHit::Close,"search-settings"=>SearchPanelHit::IndexSettings,
             "search-refresh"=>{self.cancel_fast_search();SearchPanelHit::Submit},
@@ -246,7 +251,25 @@ impl WindowState {
                 self.search_controls_mut().category = category;
                 unsafe { self.request_integrated_search(true); }
             }
-            SearchPanelHit::Scope => unsafe { self.search_scope_menu(); },
+            SearchPanelHit::Scope => unsafe {self.search_scope_menu();},
+            SearchPanelHit::ToggleScope => {
+                let current=self.search_controls().origin.as_ref().and_then(super::integrated_search::font_scope::folder_scope)
+                    .or_else(||super::integrated_search::font_scope::folder_scope(self.current_location()));
+                if self.search_controls().scope.is_none() && current.is_none(){unsafe{self.search_scope_menu();}return;}
+                let next=if self.search_controls().scope.is_some(){None}else{current};
+                self.search_controls_mut().scope=next;
+                self.crumbs_for=None;
+                unsafe {self.request_integrated_search(true);self.update_address();}
+            },
+            SearchPanelHit::Apps => {
+                if !self.session.ui.search_applications || self.search_controls().scope.is_some(){return;}
+                let apps=crate::application_search::matches(&navigation::window_text(self.search_edit));
+                self.search_controls_mut().app_matches=apps.len();
+                let anchor=if self.layout.search_panel.apps.is_empty(){self.layout.search}else{self.layout.search_panel.apps};
+                if let Some(id)=super::input::popup(self.hwnd,&menus::menu(apps.rows()),Some(anchor)){
+                    if let Err(error)=apps.open(self.hwnd,&id){self.show_message(error.to_string());}
+                }
+            }
             SearchPanelHit::Sort => unsafe { self.search_sort_menu(); },
             SearchPanelHit::Previous => {
                 let controls = self.search_controls_mut();
@@ -297,7 +320,8 @@ impl WindowState {
             _ => return,
         };
         self.search_controls_mut().scope = scope;
-        unsafe { self.request_integrated_search(true); }
+        self.crumbs_for=None;
+        unsafe { self.request_integrated_search(true); self.update_address(); }
     }
 
     unsafe fn search_sort_menu(&mut self) {

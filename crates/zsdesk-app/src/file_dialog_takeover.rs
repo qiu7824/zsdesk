@@ -124,13 +124,18 @@ fn multiple(automation:&IUIAutomation,dialog:HWND)->Option<bool>{
 }
 #[derive(Clone,PartialEq)]
 struct Contract{kind:SelectionKind,name:isize,types:isize,multiple:bool,accept:String,initial:zsdesk_core::model::explorer::ShellLocation}
-#[derive(Default)]struct StableContract(Option<(Contract,Instant)>);
+#[derive(Default)]
+struct StableContract {
+    observed:Option<(Contract,Instant)>,
+    last_probe:Option<Instant>,
+    inspected_name:Option<isize>,
+}
 impl StableContract{
     fn observe(&mut self,value:Contract,now:Instant)->bool{
-        if self.0.as_ref().is_none_or(|(previous,_)|previous!=&value){self.0=Some((value,now));return false;}
-        self.0.as_ref().is_some_and(|(_,since)|now.saturating_duration_since(*since)>=Duration::from_millis(150))
+        if self.observed.as_ref().is_none_or(|(previous,_)|previous!=&value){self.observed=Some((value,now));return false;}
+        self.observed.as_ref().is_some_and(|(_,since)|now.saturating_duration_since(*since)>=Duration::from_millis(150))
     }
-    fn reset(&mut self){self.0=None;}
+    fn reset(&mut self){self.observed=None;}
 }
 struct Session{source:guard::Identity,name:HWND,types:HWND,kind:SelectionKind,multiple:bool,accept:String,token:u64,picker:Option<isize>,guard:Option<guard::Guard>,early:Option<watcher::Claim>,worker:Option<JoinHandle<()>>,fallback:bool}
 struct PendingReturn{outcome:Outcome,started:Instant,reported_wait:bool,folder_navigation:Option<PathBuf>}
@@ -235,6 +240,14 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                     }
                     let result=if let Some(early)=&session.early{early.bind(window)}else{guard::Guard::hide(session.source.clone(),window,token).map(|guard|session.guard=Some(guard))};
                     if let Err(error)=result{last_error=Some(error.to_string());session.close_picker();}
+                    else {
+                        let foreground=unsafe {GetForegroundWindow()};
+                        let mut pid=0;
+                        unsafe {GetWindowThreadProcessId(foreground,Some(&mut pid));}
+                        if pid==session.source.pid || foreground.0.is_null() {
+                            let _=unsafe {SetForegroundWindow(HWND(window as *mut _))};
+                        }
+                    }
                 }else{session.close_picker();}
             },
             Event::UseOriginal{token}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
@@ -300,14 +313,17 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
         if enabled&&sessions.len()<4{
             let mut index=0;
             while index<preparing.len()&&sessions.len()<4{
-                let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
-                if part.shell&&!part.name.0.is_null(){
+                let source=preparing[index].source();let dialog=source.hwnd();let token=preparing[index].token();
+                let entry=contracts.entry(token).or_default();
+                if entry.last_probe.is_some_and(|at|at.elapsed()<Duration::from_millis(35)){index+=1;continue;}
+                entry.last_probe=Some(Instant::now());
+                let part=parts(dialog);
+                if part.shell && !part.name.is_invalid() && entry.inspected_name!=Some(part.name.0 as isize){
                     if let Err(reason)=capabilities::inspect(dialog,&part,automation.as_ref()){
-                        // Releasing an unbound claim restores the same native
-                        // window. No replica is opened and no choice is sent.
                         contracts.remove(&token);drop(preparing.remove(index));
                         preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
                     }
+                    entry.inspected_name=Some(part.name.0 as isize);
                 }
                 let Some(kind)=dialog_kind(dialog,&part,automation.as_ref()).filter(|_|part.shell&&!part.name.0.is_null())else{contracts.entry(token).or_default().reset();index+=1;continue;};
                 if let(Some(initial),Some(multiple))=(text(part.address).and_then(|value|initial_location(&value)),automation.as_ref().and_then(|automation|multiple(automation,dialog))){
@@ -323,7 +339,11 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                     }
                     contracts.remove(&token);let early=preparing.remove(index);let(types,filter)=types(part.types);
                     let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
-                    let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
+                    let owner=unsafe {GetWindow(dialog,GW_OWNER)}.ok().and_then(|window|{
+                        let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+                        (pid==source.pid).then_some((window.0 as isize,pid))
+                    });
+                    let options=Options{owner,token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
                     let config=profile.to_path_buf();let report=tx.clone();
                     let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
                         let result=std::panic::catch_unwind(||crate::storage::load(&config).and_then(|session|crate::window::picker::run(session,config,options)))

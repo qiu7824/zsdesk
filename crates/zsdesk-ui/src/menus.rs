@@ -308,8 +308,10 @@ fn search_settings(ui: &ExplorerUi) -> MenuItemSpec {
             entry(zsdesk_core::i18n::text("空闲 15 分钟释放索引"), "search-native-idle-900",builtin,ui.search_idle_seconds==900),
         ]),
         MenuItemSpec::Separator,
-        entry(zsdesk_core::i18n::text("搜索全部本地磁盘"), "search-all-files", true, ui.search_all_files),
-        entry(zsdesk_core::i18n::text("仅搜索当前文件夹"), "search-current-folder", true, !ui.search_all_files),
+        entry(zsdesk_core::i18n::text("搜索全部本地磁盘"), "search-all-files", true, ui.search_all_files && !ui.search_switch_scope),
+        entry(zsdesk_core::i18n::text("仅搜索当前文件夹"), "search-current-folder", true, !ui.search_all_files && !ui.search_switch_scope),
+        entry(zsdesk_core::i18n::text("按位置搜索（可快速切换）"), "search-switch-scope", true, ui.search_switch_scope),
+        entry(zsdesk_core::i18n::text("搜索已安装的应用"), "search-applications", true, ui.search_applications),
         entry(zsdesk_core::i18n::text("显示文件夹大小"), "everything-folder-sizes", true, ui.everything_folder_sizes),
         MenuItemSpec::Separator,
         item(zsdesk_core::i18n::text("重建文件名索引"), "search-rebuild-index"),
@@ -405,8 +407,10 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "search-native-idle-300"=>ui.search_idle_seconds=300,
         "search-native-idle-900"=>ui.search_idle_seconds=900,
         "hover-preview" => ui.hover_preview = !ui.hover_preview,
-        "search-all-files" => ui.search_all_files = true,
-        "search-current-folder" => ui.search_all_files = false,
+        "search-all-files" => { ui.search_all_files = true; ui.search_switch_scope = false; },
+        "search-current-folder" => { ui.search_all_files = false; ui.search_switch_scope = false; },
+        "search-switch-scope" => ui.search_switch_scope = true,
+        "search-applications" => ui.search_applications = !ui.search_applications,
         _ => {
             let Some(item) = choice.strip_prefix("command-bar-item-").and_then(CommandBarItem::from_key) else { return false };
             let visible = ui.command_bar.item_visible(item);

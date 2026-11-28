@@ -7,7 +7,7 @@ use zsui::{Dpi, Rect, View, ViewLayoutCx, ViewPaintCx, WindowsGdiDrawSink};
 
 const SUBCLASS: usize = 0x5a42;
 pub(super) fn owns(id: i32) -> bool {
-    matches!(id, 12 | 16 | 17) || (FIRST_FILTER..FIRST_FILTER + FILTERS.len() as i32).contains(&id)
+    matches!(id, 12 | 16 | 17 | 18) || (FIRST_FILTER..FIRST_FILTER + FILTERS.len() as i32).contains(&id)
 }
 
 pub(super) struct Buttons {

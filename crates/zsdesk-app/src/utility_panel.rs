@@ -25,7 +25,7 @@ fn panel_title(kind:Kind)->&'static str{
 }
 struct UpdateReply{alive:AtomicBool,value:Mutex<Option<Result<crate::update_check::Outcome,String>>>}
 struct Panel{hwnd:HWND,edit:HWND,list:HWND,action:HWND,close:HWND,font:HFONT,title_font:HFONT,brush:HBRUSH,input_brush:HBRUSH,
-    dpi:u32,text_percent:u16,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,incoming:Vec<PathBuf>,awaiting_page:bool,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
+    search_apps:bool,dpi:u32,text_percent:u16,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,incoming:Vec<PathBuf>,awaiting_page:bool,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
     result_menu:Option<result_menu::Session>,rename_target:Option<result_menu::Target>,search_view:SearchView,sort:SearchSort,offset:u32,has_next:bool,detail_reader:Option<details::Reader>,
     info:Vec<InfoRow>,scroll:i32,busy:bool,search_error:bool,update_release:Option<crate::update_check::Release>,update_package:Option<(PathBuf,bool,String)>}
 impl Drop for Panel{fn drop(&mut self){self.reply.alive.store(false,Ordering::Release);if let Some(engine)=&self.engine{engine.cancel();}
@@ -108,7 +108,7 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let caption=panel_title(kind);
     let info=if kind==Kind::Shortcuts{content::shortcut_rows(&body)}else{Vec::new()};
     let state=Rc::new(RefCell::new(Panel{hwnd:HWND::default(),edit:HWND::default(),list:HWND::default(),action:HWND::default(),close:HWND::default(),
-        font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),dpi:96,text_percent:ui.interface_text_percent,palette,kind,profile:profile.into(),body,
+        font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),search_apps:ui.search_applications,dpi:96,text_percent:ui.interface_text_percent,palette,kind,profile:profile.into(),body,
         status:match kind{Kind::Search=>String::new(),Kind::Shortcuts=>zsdesk_core::i18n::text("滚动查看全部快捷键 · Esc 关闭").into(),Kind::About=>String::new()},paths:Vec::new(),incoming:Vec::new(),awaiting_page:false,engine:None,generation:0,
         reply:Arc::new(UpdateReply{alive:AtomicBool::new(true),value:Mutex::new(None)}),adopted:false,result_menu:None,rename_target:None,search_view:if kind==Kind::Search{SearchView::load(profile)}else{SearchView::default()},sort:SearchSort::NameAsc,offset:0,has_next:false,detail_reader:None,info,scroll:0,busy:false,search_error:false,update_release:None,update_package:None}));
     let pointer=Rc::into_raw(state.clone());
@@ -134,6 +134,11 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
 }
 impl Panel{
     fn warm_search(&mut self, ui: &zsdesk_core::model::explorer::ExplorerUi) {
+        self.search_apps=ui.search_applications;
+        if self.search_apps{crate::application_search::warm();}
+        if let Ok(button)=unsafe {GetDlgItem(Some(self.hwnd),18)}{
+            let _=unsafe {ShowWindow(button,if self.search_apps{SW_SHOWNA}else{SW_HIDE})};
+        }
         let options=SearchOptions::from_ui(ui);
         if !options.backend.is_builtin(){return;}
         if self.engine.is_none(){self.engine=FastSearch::for_profile(&self.profile,self.hwnd,RESULTS,options).ok();}
@@ -148,7 +153,7 @@ impl Panel{
     }
     fn s(&self,n:i32)->i32{n*self.dpi as i32/96}
     fn child(&self,class:PCWSTR,label:&str,id:usize,style:WINDOW_STYLE)->Result<HWND>{
-        let style=if matches!(id,12|13|14)||(self.kind==Kind::Search && (matches!(id,16|17)||(FIRST_FILTER as usize..FIRST_FILTER as usize+FILTERS.len()).contains(&id))){style|WINDOW_STYLE(BS_OWNERDRAW as u32)}else{style};
+        let style=if matches!(id,12|13|14)||(self.kind==Kind::Search && (matches!(id,16|17|18)||(FIRST_FILTER as usize..FIRST_FILTER as usize+FILTERS.len()).contains(&id))){style|WINDOW_STYLE(BS_OWNERDRAW as u32)}else{style};
         let hwnd=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),class,PCWSTR(wide(label).as_ptr()),WS_CHILD|WS_VISIBLE|style,0,0,0,0,Some(self.hwnd),Some(HMENU(id as*mut _)),None,None)}?;
         unsafe{SendMessageW(hwnd,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(0)));SetWindowSubclass(hwnd,Some(control_proc),1,self.hwnd.0 as usize).ok()?;}
         if self.kind==Kind::Search && search_buttons::owns(id as i32){self.search_view.buttons.attach(hwnd,id as i32)?;}
@@ -177,6 +182,8 @@ impl Panel{
             self.child(w!("BUTTON"),zsdesk_core::i18n::text("上一页"),16,WS_TABSTOP)?;
             self.child(w!("BUTTON"),zsdesk_core::i18n::text("下一页"),17,WS_TABSTOP)?;
             for (i,(label,_)) in FILTERS.iter().enumerate(){self.child(w!("BUTTON"),zsdesk_core::i18n::text(label),FIRST_FILTER as usize+i,WS_TABSTOP)?;}
+            let apps=self.child(w!("BUTTON"),zsdesk_core::i18n::text("应用"),18,WS_TABSTOP)?;
+            let _=unsafe{ShowWindow(apps,if self.search_apps{SW_SHOWNA}else{SW_HIDE})};
             self.refresh_headings();self.detail_reader=Some(details::Reader::new(self.hwnd)?);
             self.action=self.child(w!("BUTTON"),zsdesk_core::i18n::text("打开文件位置"),12,WS_TABSTOP)?;
             let _=unsafe{EnableWindow(self.action,false)};
@@ -242,7 +249,14 @@ impl Panel{
     }
     fn search(&mut self){
         self.cancel_result_menu();
-        let query=search_ui::filtered_query(&text(self.edit),self.search_view.buttons.selected.get());self.incoming.clear();self.search_view.staged=None;self.awaiting_page=true;self.has_next=false;self.page_buttons();
+        let input=text(self.edit);
+        if self.search_apps{
+            if let Ok(button)=unsafe{GetDlgItem(Some(self.hwnd),18)}{
+                let caption=crate::application_search::matches(&input).caption();
+                if text(button)!=caption{set_text(button,&caption);}
+            }
+        }
+        let query=search_ui::filtered_query(&input,self.search_view.buttons.selected.get());self.incoming.clear();self.search_view.staged=None;self.awaiting_page=true;self.has_next=false;self.page_buttons();
         if query.trim().is_empty(){self.clear_pending_page();if let Some(engine)=&self.engine{engine.cancel_query();}self.busy=false;self.search_error=false;self.page_buttons();self.status.clear();return;}
         if self.engine.is_none(){match crate::storage::load(&self.profile).and_then(|session|FastSearch::for_profile(&self.profile,self.hwnd,RESULTS,SearchOptions::from_ui(&session.ui))){
             Ok(engine)=>self.engine=Some(engine),Err(error)=>{self.clear_pending_page();self.busy=false;self.search_error=true;self.page_buttons();self.status=zsdesk_core::tr_format!("搜索不可用：{error:#}" , error=error);return;}}}
@@ -361,6 +375,8 @@ impl Panel{
         true
     }
     fn style_list(&self){self.search_view.table.theme(self.palette);zsdesk_windows::theme::theme_control(self.list,self.palette.mode==Mode::Dark);
+        let header=HWND(unsafe{SendMessageW(self.list,LVM_GETHEADER,None,None)}.0 as _);
+        if !header.0.is_null(){zsdesk_windows::theme::theme_control(header,self.palette.mode==Mode::Dark);}
         report_list::style(self.list,rgb(self.palette.content),composite(self.palette.text,self.palette.content));}
     fn refresh_headings(&self){
         for (col,title) in HEADINGS.iter().enumerate(){let arrow=match (col,self.sort){
@@ -598,6 +614,17 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
                 if state.search_view.buttons.select(hwnd,filter){
                     crate::quick_search::timing::action("filter",filter,state.paths.len());state.offset=0;state.search();
                 }
+            }else if id==18 && event==BN_CLICKED && state.kind==Kind::Search && state.search_apps{
+                let results=crate::application_search::matches(&text(state.edit));
+                let button=unsafe{GetDlgItem(Some(hwnd),18)}.unwrap_or_default();
+                let mut bounds=RECT::default();let _=unsafe{GetWindowRect(button,&mut bounds)};
+                let anchor=crate::flyout_menu::MenuAnchor::Point{x:bounds.left,y:bounds.bottom};
+                let dark=state.palette.mode==Mode::Dark;
+                drop(state);
+                if let Some(id)=crate::flyout_menu::show(hwnd,&zsdesk_ui::menus::menu(results.rows()),anchor,dark){
+                    if let Err(error)=results.open(hwnd,&id){if let Ok(mut panel)=slot.try_borrow_mut(){panel.status=error.to_string();}}
+                }
+                return LRESULT(0);
             }else if id==13{unsafe{PostMessageW(Some(hwnd),WM_CLOSE,WPARAM(0),LPARAM(0)).ok();}}
             else if id==12&&event==BN_CLICKED{match state.kind{Kind::Search=>state.open_selected(true),Kind::About=>state.updates(),Kind::Shortcuts=>{
                 let profile=state.profile.clone();

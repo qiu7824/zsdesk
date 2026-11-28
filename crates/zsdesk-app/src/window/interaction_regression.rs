@@ -417,9 +417,6 @@ fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Va
         unsafe{state.close_group(1,false);}ensure!(state.session.tabs.iter().map(|tab|tab.id).collect::<Vec<_>>()==vec![1,2],"close others removed a locked tab");
         unsafe{state.close_group(0,true);}ensure!(state.session.tabs.len()==1&&state.session.tabs[0].locked,"close right removed a locked tab");
     }
-    for (message,wp) in [(WM_CLOSE,0usize),(WM_SYSCOMMAND,SC_CLOSE as usize)]{unsafe{SendMessageW(runner.hwnd,message,Some(WPARAM(wp)),None);}ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"window close bypassed a tab lock");}
-    {runner.slot.borrow_mut().as_mut().unwrap().session.tabs[0].locked=false;}
-    unsafe{SendMessageW(runner.hwnd,WM_CLOSE,None,None);}ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"hidden pane lock was ignored");
     ensure!(unsafe{SendMessageW(runner.hwnd,WM_QUERYENDSESSION,None,None)}.0==1,"tab lock blocked OS session shutdown");
     let rect=|id:u64|->Result<LayoutRect>{let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();let index=state.session.bookmarks.iter().position(|b|b.id==id).context("bookmark id")?;Ok(state.bookmark_rect(index))};
     let drag=|from:LayoutRect,to:POINT|{
@@ -465,9 +462,9 @@ fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Va
         ensure!(saved_items==state.session.bookmarks,"appearance settings changed bookmark data");
         state.session.secondary_pane.tabs[0].locked=false;state.session.tabs[0].locked=true;
     }
-    unsafe{SendMessageW(runner.hwnd,WM_ENDSESSION,Some(WPARAM(1)),None);SendMessageW(runner.hwnd,WM_CLOSE,None,None);}
-    ensure!(!unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"OS session completion was blocked by a lock");
-    Ok(serde_json::json!({"locked_shortcuts_middle_double":true,"locked_close_groups":true,"locked_window_and_system_close":true,"hidden_pane_lock":true,
+    unsafe{SendMessageW(runner.hwnd,WM_CLOSE,None,None);}
+    ensure!(!unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"window close was blocked by a tab lock");
+    Ok(serde_json::json!({"locked_shortcuts_middle_double":true,"locked_close_groups":true,"window_close_with_locked_tabs":true,"hidden_pane_lock":true,
         "os_session_shutdown_allowed":true,"bookmark_drag_into_category":true,"bookmark_drag_to_root":true,"bookmark_sibling_order":true,"bookmark_top_and_right_layouts":true,"persisted_categories_and_locks":true}))
 }
 

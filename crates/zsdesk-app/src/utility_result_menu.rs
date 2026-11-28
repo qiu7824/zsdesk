@@ -188,17 +188,18 @@ impl Panel {
         let extended = !keyboard && unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let context = MenuViewContext {
             folder,
-            results: common.is_none(),
+            results: true,
             keyboard,
             f10: keyboard,
         };
         let single = targets.len() == 1;
+        let options=crate::context_preferences::native(&preferences);
         let client = AsyncClient::spawn_with_context(
             self.hwnd,
             point,
             targets.iter().map(|t| t.pidl.clone()).collect(),
             common,
-            crate::context_preferences::native(&preferences),
+            options,
             MenuInterceptions {
                 open: single,
                 rename: single,

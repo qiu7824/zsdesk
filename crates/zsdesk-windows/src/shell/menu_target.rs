@@ -27,6 +27,17 @@ fn list_hit(window:HWND,point:POINT)->Option<Hit>{
     let mut point=point;if !unsafe{ScreenToClient(window,&mut point)}.as_bool(){return None;}
     let mut client=RECT::default();if unsafe{GetClientRect(window,&mut client)}.is_err(){return None;}
     if point.x<client.left||point.x>=client.right||point.y<client.top||point.y>=client.bottom{return Some(Hit::plain(ViewMenuTarget::NativeControl));}
+    let header=HWND(unsafe{SendMessageW(window,LVM_GETHEADER,None,None)}.0 as *mut _);
+    if !header.is_invalid() && unsafe{IsWindowVisible(header)}.as_bool() {
+        let mut bounds=RECT::default();
+        if unsafe{GetWindowRect(header,&mut bounds)}.is_ok(){
+            let mut screen=point;
+            if unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window,&mut screen)}.as_bool()
+                && screen.x>=bounds.left && screen.x<bounds.right && screen.y>=bounds.top && screen.y<bounds.bottom{
+                return Some(Hit::plain(ViewMenuTarget::NativeControl));
+            }
+        }
+    }
     let mut info=LVHITTESTINFO{pt:point,iItem:-1,iSubItem:-1,iGroup:-1,..Default::default()};
     let report=unsafe{GetWindowLongPtrW(window,GWL_STYLE)}as u32&LVS_TYPEMASK==LVS_REPORT;
     let message=if report{LVM_SUBITEMHITTEST}else{LVM_HITTEST};
@@ -38,6 +49,27 @@ fn list_hit(window:HWND,point:POINT)->Option<Hit>{
     let mut hit=Hit::plain(if index>=0{ViewMenuTarget::Selection}else{ViewMenuTarget::Background});
     if index>=0{hit.list_item=Some((window,index));}Some(hit)
 }
+// DirectUI on Windows 10 sometimes exposes the entire list through
+// MSAA for a point on a row. Use the point provider's selection pattern
+// so a background gesture cannot capture the first click on that row.
+fn automation_point_hit(automation:&IUIAutomation,point:POINT)->Option<Hit>{
+    let mut element=unsafe{automation.ElementFromPoint(point)}.ok()?;
+    let walker=unsafe{automation.ControlViewWalker()}.ok()?;
+    for _ in 0..8{
+        let kind=unsafe{element.CurrentControlType()}.ok()?;
+        if [UIA_HeaderItemControlTypeId,UIA_HeaderControlTypeId,UIA_EditControlTypeId,UIA_ScrollBarControlTypeId].contains(&kind){
+            return Some(Hit::plain(ViewMenuTarget::NativeControl));
+        }
+        if [UIA_ListItemControlTypeId,UIA_DataItemControlTypeId,UIA_TreeItemControlTypeId].contains(&kind){
+            let _:IUIAutomationSelectionItemPattern=unsafe{element.GetCurrentPatternAs(UIA_SelectionItemPatternId)}.ok()?;
+            let mut hit=Hit::plain(ViewMenuTarget::Selection);hit.automation=Some(element);return Some(hit);
+        }
+        if [UIA_ListControlTypeId,UIA_DataGridControlTypeId,UIA_WindowControlTypeId].contains(&kind){break;}
+        element=unsafe{walker.GetParentElement(&element)}.ok()?;
+    }
+    None
+}
+
 fn automation_hit(automation:&IUIAutomation,object:&IAccessible,child:&VARIANT)->Option<Hit>{
     let element=unsafe{automation.ElementFromIAccessible(object,i32::try_from(child).ok()?)}.ok()?;
     let kind=unsafe{element.CurrentControlType()}.ok()?;
@@ -83,7 +115,10 @@ fn select_list_accessible(window:HWND,index:i32)->Result<()>{
     if role_target(role)!=Some(ViewMenuTarget::Selection){return Err(Error::from_hresult(HRESULT(0x800704c7u32 as i32)));}
     accessible_selection(&accessible,&child)
 }
-fn locate(view:HWND,_source:HWND,position:LPARAM)->Hit{
+fn locate(view:HWND,message_source:HWND,position:LPARAM)->Hit{
+    if message_source!=view && unsafe{IsChild(view,message_source)}.as_bool() && super::control_owns_context_menu(view,message_source) {
+        return Hit::plain(ViewMenuTarget::NativeControl);
+    }
     if position.0==-1{return Hit::plain(ViewMenuTarget::CurrentSelection);}
     let point=POINT{x:position.0 as i16 as i32,y:(position.0>>16)as i16 as i32};
     let mut rect=RECT::default();
@@ -138,12 +173,28 @@ fn locate(view:HWND,_source:HWND,position:LPARAM)->Hit{
     Hit::plain(ViewMenuTarget::Unresolved)
 }
 
-pub(super) fn classify(view:HWND,source:HWND,position:LPARAM)->ViewMenuTarget{locate(view,source,position).target}
+fn pointer_hit(view:HWND,source:HWND,position:LPARAM)->Hit{
+    let hit=locate(view,source,position);
+    if position.0==-1 || !matches!(hit.target,ViewMenuTarget::Background|ViewMenuTarget::Unresolved){return hit;}
+    let point=POINT{x:position.0 as i16 as i32,y:(position.0>>16) as i16 as i32};
+    let mut bounds=RECT::default();
+    let dpi=unsafe{windows::Win32::UI::HiDpi::GetDpiForWindow(view)}.max(96);
+    if unsafe{GetWindowRect(view,&mut bounds)}.is_err() || point.y<bounds.top || (!crate::theme::windows10_shell(crate::theme::os_build()) && point.y-bounds.top>64*dpi as i32/96){return hit;}
+    let window=unsafe{WindowFromPoint(point)};
+    if (window==view || unsafe{IsChild(view,window)}.as_bool()) && class(window)=="DirectUIHWND" {
+        if let Ok(ui)=unsafe{CoCreateInstance::<_,IUIAutomation>(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}{
+            if let Some(resolved)=automation_point_hit(&ui,point){return resolved;}
+        }
+    }
+    hit
+}
+
+pub(super) fn classify(view:HWND,source:HWND,position:LPARAM)->ViewMenuTarget{pointer_hit(view,source,position).target}
 
 /// Mouse menus bind to the clicked item. Preserve an existing multi-selection
 /// only when that item already belongs to it; keyboard menus use the selection.
 pub(super) fn prepare(view:HWND,source:HWND,position:LPARAM)->Result<ViewMenuTarget>{
-    let hit=locate(view,source,position);
+    let hit=pointer_hit(view,source,position);
     if hit.target!=ViewMenuTarget::Selection{return Ok(hit.target);}
     if let Some((window,index))=hit.list_item{
         let Some(identity)=list_identity(window,index)else{select_list_accessible(window,index)?;return Ok(hit.target);};

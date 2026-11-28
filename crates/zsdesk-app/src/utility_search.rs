@@ -230,10 +230,15 @@ impl Panel {
         let input = self.input_plan(width).text_bounds;
         move_to(self.edit, input.x, input.y + (input.height - s(26)) / 2, input.width, s(26));
         let mut left = s(16);
-        for (i, w) in [60, 60, 75, 60, 60, 60, 60, 60].into_iter().enumerate() {
-            move_to(child(FIRST_FILTER + i as i32), left, s(65), s(w), s(29));
-            left += s(w + 5);
+        let widths=[60,60,75,60,60,60,60,60].map(s);
+        let total=widths.iter().sum::<i32>();
+        let available=if self.search_apps{(width-s(32)-s(78)-8*s(5)).clamp(8,total)}else{total};
+        for (i,width) in widths.into_iter().enumerate(){
+            let scaled=(width*available/total).max(1);
+            move_to(child(FIRST_FILTER+i as i32),left,s(65),scaled,s(29));
+            left+=scaled+s(5);
         }
+        move_to(child(18),left,s(65),(width-left-s(16)).clamp(1,s(86)),s(29));
         move_to(self.list, s(16), s(104), width - s(32), height - s(156));
         let available = (width - s(52)).max(0);
         for (i, w) in self

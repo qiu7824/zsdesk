@@ -35,6 +35,14 @@ fn expression(raw:&str,controls:&SearchControls)->String{
     terms.join(" ")
 }
 
+pub(super) fn default_scope(ui: &zsdesk_core::model::explorer::ExplorerUi, location: &ShellLocation) -> Option<PathBuf> {
+    match location {
+        ShellLocation::Search { scope, .. } => scope.clone(),
+        location if ui.search_switch_scope || !ui.search_all_files || location.as_path().is_some_and(crate::fast_search::network::is_remote) => font_scope::folder_scope(location),
+        _ => None,
+    }
+}
+
 impl WindowState{
     pub(super) unsafe fn sync_search_tab_edit(&mut self) {
         if self.background_pane { return; }
@@ -48,11 +56,7 @@ impl WindowState{
         }
         let location = self.current_location().clone();
         let fallback = match &location { ShellLocation::Search { query, .. } => query.clone(), _ => String::new() };
-        let scope = match &location {
-            ShellLocation::Search { scope, .. } => scope.clone(),
-            location if !self.session.ui.search_all_files||location.as_path().is_some_and(crate::fast_search::network::is_remote) => font_scope::folder_scope(location),
-            _ => None,
-        };
+        let scope = default_scope(&self.session.ui, &location);
         let controls = self.search_panel.tabs.entry(id).or_insert_with(|| SearchControls { scope, ..Default::default() });
         let text = controls.draft.clone().unwrap_or(fallback);
         controls.draft = Some(text.clone());
@@ -90,15 +94,12 @@ impl WindowState{
         }
     }
     pub(super) unsafe fn open_integrated_search(&mut self){
+        if self.session.ui.search_applications { crate::application_search::warm(); }
         self.end_address_edit();
         unsafe { self.sync_search_tab_edit(); }
         if !self.search_panel.open{
             self.search_panel.open=true;
-            let scope = match self.current_location() {
-                ShellLocation::Search { scope, .. } => scope.clone(),
-                location if !self.session.ui.search_all_files||location.as_path().is_some_and(crate::fast_search::network::is_remote) => font_scope::folder_scope(location),
-                _ => None,
-            };
+            let scope = default_scope(&self.session.ui, self.current_location());
             if self.search_controls().origin.is_none() { self.search_controls_mut().scope = scope; }
             self.relayout();self.position_children();self.invalidate();
         }
@@ -114,6 +115,9 @@ impl WindowState{
         self.search_panel.open=true;
         let raw=super::navigation::window_text(self.search_edit);
         self.search_controls_mut().draft = Some(raw.clone());
+        self.search_controls_mut().app_matches=if self.session.ui.search_applications && self.search_controls().scope.is_none() && !raw.trim().is_empty(){
+            crate::application_search::matches(&raw).len()
+        }else{0};
         if reset_page{self.search_controls_mut().offset=0;}
         let controls=self.search_controls();
         if raw.trim().is_empty()&&controls.category==SearchCategory::All{
@@ -193,6 +197,12 @@ impl WindowState{
         }
     }
     pub(super) fn record_search_progress(&mut self,event:&crate::fast_search::SearchEvent){
+        if event.finished && self.session.ui.search_applications && self.search_controls().scope.is_none(){
+            if let ShellLocation::Search{query,..}=self.current_location(){
+                self.search_controls_mut().app_matches=crate::application_search::matches(query).len();
+                self.invalidate_rect(self.layout.search);
+            }
+        }
         let shown=self.fast_found;let controls=self.search_controls_mut();
         controls.total=event.indexed;controls.shown=shown;controls.busy=!event.finished;controls.error=event.error.clone();
         // A deletion can leave the current page beyond the new end.
@@ -210,6 +220,16 @@ impl WindowState{
         let query=expression("alpha | beta",&controls);
         assert!(query.starts_with("\"E:\\中文 目录\\\" ext:doc;"));
         assert!(query.ends_with("<alpha | beta>"));
+    }
+    #[test]fn automatic_scope_tracks_the_current_folder_and_this_pc(){
+        let mut ui=zsdesk_core::model::explorer::ExplorerUi::default();
+        let path=PathBuf::from(r"C:\work");
+        let folder=ShellLocation::Path(path.clone());
+        assert_eq!(default_scope(&ui,&folder),None);
+        ui.search_switch_scope=true;
+        assert_eq!(default_scope(&ui,&folder),Some(path));
+        assert_eq!(default_scope(&ui,&ShellLocation::ThisPc),None);
+        assert_eq!(default_scope(&ui,&ShellLocation::Search{scope:None,query:"text".into()}),None);
     }
     #[test]fn categories_work_without_a_keyword(){
         let controls=SearchControls{category:SearchCategory::Folders,..Default::default()};

@@ -9,6 +9,8 @@
 mod bookmarks;
 mod geometry;
 mod window_actions;
+mod tab_transfer;
+mod detail_columns;
 mod input;
 mod keyboard;
 mod routing_settings;
@@ -193,15 +195,21 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     };
     unsafe { RegisterClassW(&wc) };
     let placement = session.ui.window;
-    let relaunch = relaunch_command(&config_path);
+    let file_window=picker.is_none();
+    let relaunch = file_window.then(||relaunch_command(&config_path)).flatten();
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
+    let picker_owner=picker.as_ref().and_then(|p|p.options.owner).and_then(|(raw,expected)|{
+        let window=HWND(raw as *mut _);
+        let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+        (pid==expected && pid!=0).then_some(window)
+    });
     state.picker=picker;
     state.secondary_window = secondary_window;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
     let hwnd = unsafe { CreateWindowExW(WINDOW_EX_STYLE::default(), pcwstr(&class), PCWSTR(wide("ZSDesk").as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h, None, None, Some(instance), Some((&*slot as *const Slot).cast()))? };
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h, picker_owner, None, Some(instance), Some((&*slot as *const Slot).cast()))? };
     // Apply the custom frame before anything is painted.
     let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
     let created = slot.borrow_mut().as_mut().map(|s| unsafe { s.create(hwnd) });
@@ -213,7 +221,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     }
     flush_deferred(hwnd,true);
     // Before the first show, so the taskbar button is created in the pin's group.
-    if !cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
+    if file_window && !cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
     if let Some((command,icon))=&relaunch{
         let _=zsdesk_windows::taskbar::set_identity(hwnd,&zsdesk_windows::taskbar::Identity{app_id:crate::edition::application_id(),
             relaunch_command:command,display_name:"ZSDesk",icon});
@@ -399,7 +407,7 @@ pub(super) enum CrumbPart { Crumb(usize), Chevron(usize), Overflow }
 pub(super) struct CrumbSlot { pub part: CrumbPart, pub rect: LayoutRect }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TabDrag { pub index: usize, pub start_axis: i32, pub moved: bool }
+pub(super) struct TabDrag { pub index: usize, pub start: POINT, pub moved: bool }
 #[derive(Clone,Copy)]
 pub(super) struct BookmarkDrag { pub id:u64,pub start:POINT,pub point:POINT,pub moved:bool }
 
@@ -660,7 +668,8 @@ impl WindowState {
         let (width, height) = self.client_size();
         let height=(height-self.picker_height()).max(0);
         let input = ChromeInput {
-            search_panel_open:self.search_panel.open,
+            search_panel_open:self.search_panel.open,quick_scope:self.session.ui.search_switch_scope,
+            search_apps:self.session.ui.search_applications && self.search_controls().scope.is_none(),
             tab_placement:self.session.ui.tab_placement,
             side_tabs_width:self.session.ui.side_tabs_width,side_tabs_compact:self.session.ui.side_tabs_compact,
             width, height, dpi:self.interface_dpi(), caption_width: self.caption_width(),
@@ -710,7 +719,8 @@ impl WindowState {
         let line = self.edit_line_height();
         let field = self.layout.search;
         let pad = self.s(10);
-        unsafe { move_control(self.search_edit, LayoutRect::new(field.x + pad, field.y + (field.height - line) / 2, (field.width - pad - self.s(34)).max(0), line)); }
+        let buttons=self.layout.search_panel.scope_toggle.width+self.layout.search_panel.apps.width;
+        unsafe { move_control(self.search_edit, LayoutRect::new(field.x + pad, field.y + (field.height - line) / 2, (field.width - pad - self.s(34) - buttons).max(0), line)); }
         let address = self.layout.address;
         unsafe { move_control(self.address_edit, LayoutRect::new(address.x + pad, address.y + (address.height - line) / 2, (address.width - pad * 2).max(0), line)); }
         let _ = unsafe { ShowWindow(self.address_edit, if self.address_editing { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
@@ -1209,6 +1219,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_COPYDATA if lp.0 != 0 => {
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
+            if data.dwData==tab_transfer::MESSAGE {
+                return tab_transfer::receive(hwnd,HWND(wp.0 as *mut _),data);
+            }
             if data.dwData==crate::instance::FOCUS_SEARCH_MAGIC{
                 if data.cbData!=1||data.lpData.is_null(){return LRESULT(0);}
                 let settings=unsafe{*(data.lpData as*const u8)};if settings>1{return LRESULT(0);}
@@ -1454,9 +1467,6 @@ impl WindowState {
             picker::WM_NATIVE_REPLY=>{self.picker_native_reply(wp.0 as u64,lp.0);return Some(LRESULT(0));},
             WM_QUERYENDSESSION=>return Some(LRESULT(1)),
             WM_ENDSESSION=>{self.session_ending=wp.0!=0;if self.session_ending{self.save();}return None;},
-            WM_CLOSE if self.picker.is_none()&&!self.session_ending&&!crate::runtime::exiting()&&self.session.has_locked_tabs()=>{
-                self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){zsdesk_core::i18n::text("隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口")}else{zsdesk_core::i18n::text("有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口")}.into());return Some(LRESULT(0));
-            },
             // Release Shell hosts while the owner is still a live window.
             // WM_DESTROY is the fallback for direct/native destruction.
             WM_CLOSE=>{if !self.session_ending&&self.picker_close_pending(){return Some(LRESULT(0));}unsafe{self.destroy();}return None;},

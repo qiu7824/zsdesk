@@ -23,3 +23,17 @@ pub fn modern(options:&ContextMenuPreferences)->bool{
     matches!(options.mode,ContextMenuMode::Windows11|ContextMenuMode::DrawnWindows11)
 }
 pub fn apply_from_profile(profile:&Path){if let Ok(session)=crate::storage::load(profile){set_context_menu_options(native(&session.ui.context_menu));}}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_explicit_quick_first_changes_the_first_page() {
+        for mode in [ContextMenuMode::Original,ContextMenuMode::Windows11,ContextMenuMode::DrawnWindows11] {
+            for quick_first in [false,true] {
+                let options=ContextMenuPreferences{mode,quick_first,..Default::default()};
+                assert_eq!(native(&options).quick_first,quick_first);
+            }
+        }
+    }
+}

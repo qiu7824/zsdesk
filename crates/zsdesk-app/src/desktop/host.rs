@@ -706,7 +706,7 @@ impl DesktopHost {
         self.config.settings.hidden = false;
         for f in &self.fences {
             if self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
-            let _ = unsafe { ShowWindow(f.hwnd, SW_SHOWNOACTIVATE) };
+            super::show_in_place(f.hwnd);
             if f.peek || f.raised_on_expand { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
         self.schedule_save();
@@ -715,11 +715,11 @@ impl DesktopHost {
 
     pub fn toggle_hidden(&mut self) {
         self.config.settings.hidden = !self.config.settings.hidden;
-        let show = if self.config.settings.hidden { SW_HIDE } else { SW_SHOWNOACTIVATE };
+        let hidden=self.config.settings.hidden;
         for f in &self.fences {
             if f.standalone { continue; }
             if !self.config.settings.hidden && self.config.fence(f.id).is_some_and(Fence::is_hidden_tab) { continue; }
-            let _ = unsafe { ShowWindow(f.hwnd, show) };
+            if hidden {let _=unsafe {ShowWindow(f.hwnd,SW_HIDE)};} else {super::show_in_place(f.hwnd);}
             if !self.config.settings.hidden && (f.peek || f.raised_on_expand) { unsafe { SetTimer(Some(f.hwnd), TIMER_PEEK, 250, None); } }
         }
         if self.config.settings.hidden { self.release_hidden_graphics(); }
@@ -730,7 +730,7 @@ impl DesktopHost {
     fn flash(&mut self, id: u64) {
         if self.config.fence(id).is_some_and(Fence::is_hidden_tab) { self.switch_tab(id); }
         if let Some(f) = self.fences.iter().find(|f| f.id == id) {
-            let _ = unsafe { ShowWindow(f.hwnd, SW_SHOWNOACTIVATE) };
+            super::show_in_place(f.hwnd);
             let _ = unsafe { SetForegroundWindow(f.hwnd) };
         }
     }
@@ -768,20 +768,21 @@ impl DesktopHost {
     /// Shows each group's active tab at the group position and hides the others.
     fn apply_visibility(&mut self) {
         for i in 0..self.fences.len() {
-            if self.config.settings.hidden && !self.fences[i].standalone { continue; }
+            let enabled=!self.config.settings.hidden || self.fences[i].standalone;
             let id = self.fences[i].id;
             let Some(fence) = self.config.fence(id).cloned() else { continue };
             let hwnd = self.fences[i].hwnd;
             let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
-            if !fence.is_hidden_tab() && !shown {
+            let visible=enabled && !fence.is_hidden_tab();
+            if visible && !shown {
                 self.fences[i].peek = false;
                 self.fences[i].raised_on_expand = false;
                 let (r,up)=screen_frame(&fence.placement,fence.collapsed,self.fences[i].standalone);self.fences[i].title_bottom=up;
                 let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
                 self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
                 self.render(id);
-                let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
-            } else if fence.is_hidden_tab() && shown {
+                super::show_in_place(hwnd);
+            } else if !visible && shown {
                 let win = &mut self.fences[i];
                 let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
                 let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) };
@@ -851,7 +852,7 @@ impl DesktopHost {
         if !self.config.settings.hidden {
             // Paint before showing so the swap does not flash.
             self.render(to);
-            let _ = unsafe { ShowWindow(new, SW_SHOWNOACTIVATE) };
+            super::show_in_place(new);
         }
         let _ = unsafe { ShowWindow(old, SW_HIDE) };
         let _ = unsafe { KillTimer(Some(old), TIMER_PEEK) };
@@ -1012,7 +1013,7 @@ impl DesktopHost {
             if let Some(index)=self.win_index(id) {let mut failed=self.fences.remove(index);failed.drop=None;failed.notify=None;}
             let _=unsafe{DestroyWindow(hwnd)};return Err(zsdesk_core::i18n::text("桌面图标绘制资源不足").into());
         }
-        if (!self.config.settings.hidden || self.config.is_released(id)) && !fence_hidden_tab(&self.config, id) { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
+        if (!self.config.settings.hidden || self.config.is_released(id)) && !fence_hidden_tab(&self.config, id) { super::show_in_place(hwnd); }
         Ok(())
     }
 
@@ -1049,6 +1050,25 @@ impl DesktopHost {
         }
         let after = if after.0.is_null() { HWND_TOP } else { after };
         for fence in self.fences.iter().filter(|f| !f.peek && !f.raised_on_expand) { super::set_z(fence.hwnd, after); }
+    }
+
+    // Promote an expanded fence only among desktop surfaces. A partially
+    // exposed desktop can receive hover input behind a normal application.
+    fn front_of_fences(&self, hwnd:HWND) {
+        let mut window=unsafe{GetTopWindow(None)}.unwrap_or_default();
+        let mut previous=HWND_TOP;
+        let mut seen=HashSet::new();
+        while !window.is_invalid() && seen.insert(window.0 as usize) {
+            if self.fences.iter().any(|f|f.hwnd==window) {
+                if window!=hwnd {
+                    let after=if previous!=HWND_TOP && unsafe{GetWindowLongPtrW(previous,GWL_EXSTYLE)} as u32 & WS_EX_TOPMOST.0!=0 {HWND_TOP}else{previous};
+                    super::set_z(hwnd,after);
+                }
+                break;
+            }
+            previous=window;
+            window=unsafe{GetWindow(window,GW_HWNDNEXT)}.unwrap_or_default();
+        }
     }
 
     pub fn lower_all(&mut self, foreground: HWND) {
@@ -1116,7 +1136,15 @@ impl DesktopHost {
         }
         if after.is_none(){if let Some(anchor)=anchor{self.place_above_desktop(anchor.hwnd);return;}}
         let after=after.unwrap_or(HWND_BOTTOM);
-        for fence in self.fences.iter().filter(|f| !f.peek && !f.raised_on_expand) { super::set_z(fence.hwnd, after); }
+        // Expanded fences can stay in front of their siblings but must follow
+        // the application band as soon as another window is restored.
+        let mut predecessor=after;
+        for raised in [true,false] {
+            for fence in self.fences.iter().rev().filter(|f|(f.peek||f.raised_on_expand)==raised){
+                super::set_z(fence.hwnd,predecessor);
+                predecessor=fence.hwnd;
+            }
+        }
     }
 
     /// Owner activation and popup menus can reorder Progman's owned windows
@@ -1791,7 +1819,7 @@ impl DesktopHost {
         win.peek=open;win.title_bottom=up;
         let hwnd=win.hwnd;
         let _=unsafe{SetWindowPos(hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE)};
-        if open { super::set_z(hwnd, HWND_TOP); } else { self.repair_layer(); }
+        if open { self.front_of_fences(hwnd); } else { self.repair_layer(); }
         // Poll instead of WM_MOUSELEAVE so menus and drags keep the fence open.
         if open { unsafe { SetTimer(Some(hwnd), TIMER_PEEK, 250, None); } } else { let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) }; }
         self.render(id);
@@ -2189,7 +2217,7 @@ impl DesktopHost {
             self.fences[index].raised_on_expand = !collapsed;
             let hwnd=self.fences[index].hwnd;
             if collapsed { self.repair_layer(); } else {
-                super::set_z(hwnd, HWND_TOP);
+                self.front_of_fences(hwnd);
                 unsafe { SetTimer(Some(hwnd), TIMER_PEEK, 250, None); }
             }
         }

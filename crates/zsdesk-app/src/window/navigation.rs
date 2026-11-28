@@ -46,6 +46,13 @@ impl WindowState {
         if let Some(index)=index {unsafe {self.select_tab(index);}}
         else {unsafe {self.new_tab(request.location);}}
     }
+    unsafe fn drain_open_requests(&mut self) {
+        // Opening the already-active folder starts no navigation and produces
+        // no completion event. Dispatch every waiting request; open_requested
+        // requeues it in its destination pane if that pane is still navigating.
+        let waiting=std::mem::take(&mut self.open_requests);
+        for request in waiting {unsafe{self.open_requested(request);}}
+    }
     pub(super) unsafe fn capture_active(&mut self) {
         if self.pending.is_some() {return;}
         let Some(id)=self.shown_tab else {return;};
@@ -80,7 +87,7 @@ impl WindowState {
         if global && self.browser_role==BrowserRole::Ordinary{
             if let Err(error)=self.reset_browser_host(){self.show_message(zsdesk_core::tr_format!("无法创建搜索结果视图：{error}", error=error));unsafe{self.navigation_failed();}return;}
         }
-        if let Some(browser) = &self.browser { browser.use_list_renderer(global || self.session.ui.interface_text_percent != 100); }
+        if let Some(browser) = &self.browser { browser.use_list_renderer(self.session.ui.interface_text_percent != 100); }
         self.browser_role=if global{BrowserRole::Results}else{BrowserRole::Ordinary};
         let result=self.browser.as_ref().map(|b|unsafe {b.navigate(&target)});
         if !matches!(result,Some(Ok(()))) {unsafe {self.navigation_failed();}return;}
@@ -145,7 +152,7 @@ impl WindowState {
             // Leaving the results: forget the scope and clear the box (unless typing).
             self.search_scope=None; self.search_result=None;
             self.search_controls_mut().origin = None;
-            let scope=if self.session.ui.search_all_files&&!location.as_path().is_some_and(crate::fast_search::network::is_remote){None}else{super::integrated_search::font_scope::folder_scope(&location)};
+            let scope=super::integrated_search::default_scope(&self.session.ui,&location);
             self.search_controls_mut().scope=scope;
             if !self.background_pane && unsafe {GetFocus()}!=self.search_edit {
                 self.search_controls_mut().draft = Some(String::new());
@@ -193,7 +200,7 @@ impl WindowState {
             self.relayout();self.position_children();
         }
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
-        else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
+        else {unsafe{self.drain_open_requests();}}
     }
     pub(super) unsafe fn navigation_failed(&mut self) {
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
@@ -210,7 +217,7 @@ impl WindowState {
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none(){if let Some(identity)=self.identity_for_source(self.browser_source){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}}
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
-        else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
+        else {unsafe{self.drain_open_requests();}}
     }
     pub(super) unsafe fn new_tab(&mut self,location:ShellLocation) {
         unsafe {self.capture_active();}
@@ -293,7 +300,11 @@ impl WindowState {
             if self.crumbs.is_empty() {self.crumbs.push(zsdesk_windows::shell::Crumb{title:target.title(),location:target.clone()});}
             self.crumbs_for=Some(target.clone());
             self.layout_crumbs();
-            let cue=wide(&if self.session.ui.search_all_files {zsdesk_core::i18n::text("快速搜索全部本地磁盘").to_string()} else {zsdesk_core::tr_format!("搜索 {}", target.title())});
+            let scope=if self.search_panel.open{self.search_controls().scope}else{super::integrated_search::default_scope(&self.session.ui,&target)};
+            let cue=wide(&match scope {
+                Some(path) => zsdesk_core::tr_format!("搜索 {}", zsdesk_core::model::explorer::path_title(&path)),
+                None => zsdesk_core::i18n::text("快速搜索全部本地磁盘").to_string(),
+            });
             unsafe {SendMessageW(self.search_edit,EM_SETCUEBANNER,Some(WPARAM(1)),Some(LPARAM(cue.as_ptr() as isize)));}
         }
         // Switching tabs restores that tab's query; live typing owns the EDIT
@@ -522,6 +533,15 @@ pub(super) fn window_text(hwnd:HWND)->String {
 
 #[cfg(test)]mod results_exit_tests{
     use super::*;
+    #[test]fn repeated_opens_of_active_folder_cannot_strand_the_reveal_queue(){
+        let mut state=WindowState::new(ExplorerSession::default(),std::path::PathBuf::from("queue-test.json"),None,false);
+        for _ in 0..3{
+            state.open_requests.push_back(crate::instance::OpenRequest{location:ShellLocation::ThisPc,selection:None,selections:Vec::new()});
+        }
+        unsafe{state.drain_open_requests();}
+        assert!(state.open_requests.is_empty());
+        assert!(state.pending.is_none());
+    }
     #[test]fn folder_navigation_retires_results_drop_and_navigation_restrictions(){
         for target in [ShellLocation::ThisPc,ShellLocation::Path(PathBuf::from(r"E:\资料"))]{
             assert!(leaves_results(BrowserRole::Results,false,&target));

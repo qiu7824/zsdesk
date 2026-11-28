@@ -344,8 +344,9 @@ fn prepare_window_session(saved:Option<ExplorerSession>,requested:Option<ShellLo
         // a folder open/reveal supplies the active location. Independent
         // windows and non-restoring startup modes still start at that target.
         let fresh=independent||!has_saved||session.ui.startup_location!=zsdesk_core::model::explorer::StartupLocation::RestoreSession;
-        if fresh{session.secondary_pane=Default::default();}
-        activate(&mut session,location,fresh);
+        if independent {session.secondary_pane=Default::default();}
+        else if fresh {session.retain_locked_tabs();}
+        activate(&mut session,location,independent);
     }else{session.apply_startup_location();}
     session
 }
@@ -365,6 +366,23 @@ fn activate(session: &mut ExplorerSession, target: ShellLocation, fresh: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cold_reveal_and_live_packet_address_the_same_file() {
+        let profile=std::path::Path::new(r"C:\profiles\测试\explorer-session.json");
+        let folder=std::path::Path::new(r"D:\微信文件\2026-11");
+        let file=folder.join("图纸, 修订 1.pdf");
+        let args=crate::explorer_forwarder::launch_arguments(profile,folder,std::slice::from_ref(&file),false).unwrap();
+        let opts=parse(args).unwrap();
+        assert!(opts.select);
+        assert_eq!(opts.target.as_deref(),Some(file.as_os_str()));
+        let packet=crate::reveal::encode(folder,std::slice::from_ref(&file)).unwrap();
+        let (live_folder,live_names)=crate::reveal::decode(&packet).unwrap();
+        assert_eq!(live_folder.join(&live_names[0]),file);
+        let plain=parse(crate::explorer_forwarder::launch_arguments(profile,folder,&[],false).unwrap()).unwrap();
+        assert!(!plain.select);
+        assert_eq!(plain.target.as_deref(),Some(folder.as_os_str()));
+        assert!(crate::explorer_forwarder::launch_arguments(profile,folder,&[PathBuf::from(r"D:\other\wrong.pdf")],false).is_err());
+    }
     #[test]fn typed_window_location_preserves_namespace_identity(){
         let location=ShellLocation::Shell{parsing_name:String::new(),title:"设备存储 中文".into(),pidl:Some(vec![4,0,7,9,0,0])};
         let args=new_window_arguments(std::path::Path::new(r"E:\配置 空格"),&location).unwrap();
